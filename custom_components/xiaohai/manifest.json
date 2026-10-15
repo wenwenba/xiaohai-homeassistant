@@ -1,0 +1,12 @@
+{
+  "domain": "xiaohai",
+  "name": "小海智家",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/wenwenba/xiaohai-homeassistant",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/wenwenba/xiaohai-homeassistant/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

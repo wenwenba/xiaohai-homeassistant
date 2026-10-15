@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "小海智家",
+        "description": "使用小海智家 App 的账号登录私有云。密码只保存在 Home Assistant 里。",
+        "data": {
+          "username": "手机号或邮箱",
+          "password": "密码",
+          "country_code": "国家码"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "账号或密码不正确",
+      "cannot_connect": "连不上小海云，或云端拒绝了签名",
+      "unknown": "发生未知错误"
+    },
+    "abort": {
+      "already_configured": "这个账号已经添加过了"
+    }
+  }
+}

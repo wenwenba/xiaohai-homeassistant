@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Xiaohai",
+        "description": "Sign in with the account used by the Xiaohai app. The password stays in Home Assistant.",
+        "data": {
+          "username": "Phone or email",
+          "password": "Password",
+          "country_code": "Country code"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Incorrect account or password",
+      "cannot_connect": "Cannot reach the Xiaohai cloud, or the cloud rejected the signature",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This account is already configured"
+    }
+  }
+}
