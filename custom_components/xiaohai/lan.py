@@ -518,7 +518,8 @@ def _frame_body(data: bytes) -> tuple[int, bytes] | None:
     return command, frame[16:-36]
 
 
-def _open_session(sock: socket.socket, raw_key: bytes, *, encrypt: bool = True) -> bytes | None:
+def _open_session(sock: socket.socket, raw_key: bytes, *, encrypt: bool = True) -> tuple[bytes, bytes] | None:
+    """Handshake only. Command 5 is not sent here: this gateway resets when it is written alone."""
     nonce = os.urandom(16)
     payload = _aes(raw_key, nonce) if encrypt else nonce
     try:
@@ -530,14 +531,31 @@ def _open_session(sock: socket.socket, raw_key: bytes, *, encrypt: bool = True) 
     if not opened:
         return None
     remote, aes_key = opened
-    finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
-    try:
-        sock.sendall(pack_signed(2, 5, _aes(aes_key, _pad(finish)), raw_key))
-        _read_frame(sock)
-    except OSError:
-        pass
     mixed = bytes(left ^ right for left, right in zip(nonce, remote))
-    return _aes(aes_key, mixed)
+    return _aes(aes_key, mixed), remote
+
+
+def _control_frames(raw_key: bytes, session: bytes, remote: bytes, cid: str, dps: dict[str, Any], now: int) -> bytes:
+    """Finish and the control command in one write, so a reset cannot land between them."""
+    finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
+    raw = b"3.4" + (b"\x00" * 12) + json.dumps(
+        control_34(cid, dps, now),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    return pack_signed(2, 5, _aes(raw_key, _pad(finish)), raw_key) + pack_signed(
+        3, CONTROL_NEW, _aes(session, _pad(raw)), session
+    )
+
+
+def _link_error(err: BaseException) -> str:
+    if isinstance(err, TimeoutError):
+        return "连接超时"
+    if isinstance(err, ConnectionRefusedError):
+        return "拒绝连接"
+    if isinstance(err, (ConnectionResetError, BrokenPipeError)):
+        return "连接被断开"
+    return "连接失败"
 
 
 def _open_session_35(sock: socket.socket, raw_key: bytes) -> bytes | None:
@@ -724,20 +742,17 @@ def _publish_35(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any]) -> str:
 def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=3)
-    except OSError:
-        return "连接失败"
+    except OSError as err:
+        return _link_error(err)
     try:
-        session = _open_session(sock, raw_key, encrypt=not plain)
-        if not session:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        opened = _open_session(sock, raw_key, encrypt=not plain)
+        if not opened:
             return "会话失败"
-        raw = b"3.4" + (b"\x00" * 12) + json.dumps(
-            control_34(cid, dps, int(time.time())),
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode()
-        sock.sendall(pack_signed(3, CONTROL_NEW, _aes(session, _pad(raw)), session))
-    except OSError:
-        return "连接失败"
+        session, remote = opened
+        sock.sendall(_control_frames(raw_key, session, remote, cid, dps, int(time.time())))
+    except OSError as err:
+        return _link_error(err)
     finally:
         sock.close()
     return "sent"
@@ -971,6 +986,11 @@ def _self_check() -> None:
     reply = covered + hmac.new(sample, covered, hashlib.sha256).digest() + SUFFIX
     assert _signed_nonce(reply, sample) == sample
     assert _signed_nonce(reply, b"abcdef0123456789") == b""
+    frames = _control_frames(sample, sample, sample, "abcd", {"1": True}, 1)
+    assert frames.count(PREFIX) == 2
+    assert struct.unpack(">I", frames[8:12])[0] == 5
+    second = frames.find(PREFIX, 4)
+    assert struct.unpack(">I", frames[second + 8 : second + 12])[0] == CONTROL_NEW
     print("lan self-check ok")
 
 
