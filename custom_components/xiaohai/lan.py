@@ -535,27 +535,24 @@ def _open_session(sock: socket.socket, raw_key: bytes, *, encrypt: bool = True) 
     return _aes(aes_key, mixed), remote
 
 
-def _control_frames(raw_key: bytes, session: bytes, remote: bytes, cid: str, dps: dict[str, Any], now: int) -> bytes:
-    """Finish and the control command in one write, so a reset cannot land between them."""
-    finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
-    raw = b"3.4" + (b"\x00" * 12) + json.dumps(
-        control_34(cid, dps, now),
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode()
-    return pack_signed(2, 5, _aes(raw_key, _pad(finish)), raw_key) + pack_signed(
-        3, CONTROL_NEW, _aes(session, _pad(raw)), session
-    )
+def _local_command(raw_key: bytes, plain: bytes) -> bytes:
+    """Control uses the cloud local key directly. Command 5 resets this gateway."""
+    return pack_signed(1, CONTROL_NEW, _aes(raw_key, _pad(plain)), raw_key)
 
 
-def _link_error(err: BaseException) -> str:
-    if isinstance(err, TimeoutError):
-        return "连接超时"
-    if isinstance(err, ConnectionRefusedError):
-        return "拒绝连接"
-    if isinstance(err, (ConnectionResetError, BrokenPipeError)):
-        return "连接被断开"
-    return "连接失败"
+def _accepted(data: bytes, key: bytes) -> bool:
+    """True when the gateway signed the reply and did not return an error code."""
+    if len(data) < 24 or not data.startswith(PREFIX):
+        return False
+    length = struct.unpack(">I", data[12:16])[0]
+    frame = data[: 16 + length]
+    if len(frame) < 24 or not frame.endswith(SUFFIX):
+        return False
+    if length < 36 or hmac.new(key, frame[:-36], hashlib.sha256).digest() != frame[-36:-4]:
+        return False
+    # A small value here is the gateway's return code. Ciphertext is larger.
+    retcode = struct.unpack(">I", frame[16:20])[0]
+    return retcode == 0 or retcode > 16
 
 
 def _open_session_35(sock: socket.socket, raw_key: bytes) -> bytes | None:
@@ -739,23 +736,36 @@ def _publish_35(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any]) -> str:
     return "sent"
 
 
-def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
+def _exchange(ip: str, frame: bytes, key: bytes) -> bool:
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=3)
-    except OSError as err:
-        return _link_error(err)
+    except OSError:
+        return False
     try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        opened = _open_session(sock, raw_key, encrypt=not plain)
-        if not opened:
-            return "会话失败"
-        session, remote = opened
-        sock.sendall(_control_frames(raw_key, session, remote, cid, dps, int(time.time())))
-    except OSError as err:
-        return _link_error(err)
+        sock.sendall(frame)
+        return _accepted(_read_frame(sock), key)
+    except OSError:
+        return False
     finally:
         sock.close()
-    return "sent"
+
+
+def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
+    now = int(time.time())
+    bodies = [
+        b"3.4" + (b"\x00" * 12) + json.dumps(
+            control_34(cid, dps, now),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode(),
+        json.dumps(control_body(cid, dps, now), separators=(",", ":"), ensure_ascii=False).encode(),
+    ]
+    if plain:
+        bodies.reverse()
+    for body in bodies:
+        if _exchange(ip, _local_command(raw_key, body), raw_key):
+            return "sent"
+    return "网关未确认"
 
 
 def _peek(ip: str, key: str) -> str:
@@ -986,11 +996,16 @@ def _self_check() -> None:
     reply = covered + hmac.new(sample, covered, hashlib.sha256).digest() + SUFFIX
     assert _signed_nonce(reply, sample) == sample
     assert _signed_nonce(reply, b"abcdef0123456789") == b""
-    frames = _control_frames(sample, sample, sample, "abcd", {"1": True}, 1)
-    assert frames.count(PREFIX) == 2
-    assert struct.unpack(">I", frames[8:12])[0] == 5
-    second = frames.find(PREFIX, 4)
-    assert struct.unpack(">I", frames[second + 8 : second + 12])[0] == CONTROL_NEW
+    command = _local_command(sample, b"hello")
+    assert struct.unpack(">I", command[8:12])[0] == CONTROL_NEW
+    ok = PREFIX + struct.pack(">IIII", 1, CONTROL_NEW, 4 + 16 + 36, 0) + (b"\x11" * 16)
+    ok += hmac.new(sample, ok, hashlib.sha256).digest() + SUFFIX
+    bad = PREFIX + struct.pack(">IIII", 1, CONTROL_NEW, 4 + 16 + 36, 1) + (b"\x11" * 16)
+    bad += hmac.new(sample, bad, hashlib.sha256).digest() + SUFFIX
+    assert _accepted(ok, sample)
+    assert not _accepted(bad, sample)
+    assert not _accepted(ok, b"abcdef0123456789")
+    assert not _accepted(b"", sample)
     print("lan self-check ok")
 
 
