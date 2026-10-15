@@ -8,7 +8,6 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import XiaohaiCoordinator
-from .dp import CATEGORY_LABEL
 
 
 def take_new_entities(coordinator: XiaohaiCoordinator, known: set[str], factory):
@@ -60,7 +59,7 @@ class XiaohaiEntity(CoordinatorEntity[XiaohaiCoordinator]):
             "identifiers": {(DOMAIN, self._dev_id)},
             "name": device.get("name") or self._dev_id,
             "manufacturer": "小海智家",
-            "model": CATEGORY_LABEL.get(category) or device.get("productId") or category,
+            "model": device.get("productId") or category,
             "sw_version": firmware or device.get("verSw") or device.get("sv"),
         }
         if device.get("_room"):

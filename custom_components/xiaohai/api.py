@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
-from .dp import payload_shape, rooms_from_payload, schema_from_payload
+from .dp import payload_shape, rooms_from_payload, schema_field_names, schema_from_payload
 
 
 class XiaohaiError(Exception):
@@ -66,6 +66,7 @@ class XiaohaiClient:
         self._country_code = country_code.strip() or "86"
         self._sid: str | None = None
         self.last_room_note = ""
+        self.last_schema_note = ""
         self.devices: dict[str, dict[str, Any]] = {}
 
     @property
@@ -180,8 +181,10 @@ class XiaohaiClient:
                 None,
                 extra_params={"gid": str(gid)},
             )
-        except XiaohaiError:
+        except XiaohaiError as err:
+            self.last_schema_note = str(err)
             return {}
+        self.last_schema_note = schema_field_names(result)
         return schema_from_payload(result)
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:

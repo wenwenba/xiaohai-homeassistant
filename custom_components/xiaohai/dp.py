@@ -5,14 +5,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-# Category fallbacks match the live products and the Tuya standard instruction
-# set for kt (air conditioner) and wk (thermostat): set/current are separate dps.
-FALLBACK = {
-    "kt": {"kind": "climate", "power": "1", "target": "2", "current": "3", "mode": "4", "fan": "5"},
-    "wk": {"kind": "climate", "power": "1", "target": "16", "current": "24"},
-    "xfj": {"kind": "fan", "power": "1", "fan": "12"},
-}
-
 MODE_TO_HVAC = {
     "cold": "cool",
     "hot": "heat",
@@ -24,23 +16,6 @@ MODE_TO_HVAC = {
     "wet_model": "dry",
     "dry": "dry",
 }
-HVAC_TO_MODE = {
-    "cool": "cold",
-    "heat": "hot",
-    "fan_only": "wind",
-    "auto": "auto",
-    "dry": "wet",
-}
-
-CATEGORY_LABEL = {
-    "kt": "空调",
-    "wk": "地暖",
-    "xfj": "新风",
-    "jzq": "网关",
-    "wg2": "网关",
-}
-
-
 def device_online(device: dict) -> bool | None:
     """Online if any reported module is online. Missing data is unknown, not offline."""
     modules = device.get("moduleMap")
@@ -57,14 +32,25 @@ def device_online(device: dict) -> bool | None:
     return None
 
 
-def celsius(value: Any) -> float | None:
-    """Cloud temperatures are plain °C. Values above 60 are decidegrees (260 = 26.0)."""
+def celsius(value: Any, scale: int | None = None) -> float | None:
+    """Cloud temperature. Exact 0 is no reading. scale 1 means decidegrees."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if value == 0:
         return None
+    if scale is not None:
+        return float(value) / (10 ** int(scale)) if int(scale) else float(value)
     if value > 60:
         return float(value) / 10
+    return float(value)
+
+
+def scaled(value: Any, scale: int | None = None) -> float | None:
+    """Schema min/max/step, including a legitimate 0."""
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if scale:
+        return float(value) / (10 ** int(scale))
     return float(value)
 
 
@@ -79,11 +65,11 @@ def dp_value(device: dict, dp: str | None) -> Any:
     return dps.get(str(dp))
 
 
-def _code_dp(schema: dict[str, str], *codes: str, fallback: str | None = None) -> str | None:
+def _code_dp(schema: dict[str, str], *codes: str) -> str | None:
     for code in codes:
         if schema.get(code):
             return str(schema[code])
-    return fallback
+    return None
 
 
 def _code_range(schema: dict[str, str], *codes: str) -> list[str] | None:
@@ -100,56 +86,152 @@ def _code_range(schema: dict[str, str], *codes: str) -> list[str] | None:
     return None
 
 
-def profile(device: dict) -> dict | None:
-    """How to control this device. None for gateways and unknown products."""
-    category = str(device.get("category") or "")
-    if category in {"jzq", "wg2"}:
-        return None
-    schema = device.get("_schema") or {}
-    base = FALLBACK.get(category) or {}
-    kind = base.get("kind")
-    target = _code_dp(schema, "temp_set", "temp_set_c", fallback=base.get("target"))
-    current = _code_dp(schema, "temp_current", "temp_current_c", fallback=base.get("current"))
-    if kind is None and (target or current):
-        kind = "climate"
-    if kind is None:
-        return None
-    return {
-        "kind": kind,
-        "power": _code_dp(schema, "switch", "switch_led", fallback=base.get("power")),
-        "target": target,
-        "current": current,
-        "mode": _code_dp(schema, "mode", fallback=base.get("mode")),
-        "fan": _code_dp(schema, "fan_speed_enum", "fan_speed", "speed", fallback=base.get("fan")),
-        "fan_values": _code_range(schema, "fan_speed_enum", "fan_speed", "speed"),
-    }
-
-
-def _enum_range(item: dict) -> list[str] | None:
-    raw = item.get("values")
-    if raw is None:
-        raw = item.get("property")
-    if isinstance(raw, str) and raw[:1] in "{[":
+def _code_limit(schema: dict[str, str], *codes: str) -> dict[str, Any] | None:
+    for code in codes:
+        raw = schema.get(f"@limit:{code}")
+        if not raw:
+            continue
         try:
-            raw = json.loads(raw)
+            value = json.loads(raw)
         except json.JSONDecodeError:
-            return None
-    if isinstance(raw, dict):
-        raw = raw.get("range")
-    if isinstance(raw, list) and raw and all(isinstance(value, str) for value in raw):
-        return [str(value) for value in raw]
+            continue
+        if isinstance(value, dict):
+            return value
     return None
 
 
-def speed_choices(current: Any, values: list[str] | None = None) -> list[str]:
-    """Fan speeds. A cloud enum list wins; otherwise level_1 means five gears."""
-    text = "" if current is None else str(current)
-    if values:
-        choices = list(values)
-    elif "level_" in text:
-        choices = ["auto"] + [f"level_{i}" for i in range(1, 6)]
+def cloud_mode_token(mode_values: list[str] | None, hvac: str) -> str | None:
+    """Cloud enum word for a Home Assistant mode, taken from this device's range."""
+    for token in mode_values or []:
+        if MODE_TO_HVAC.get(str(token)) == hvac:
+            return str(token)
+    return None
+
+
+def hvac_names(mode_values: list[str] | None) -> list[str]:
+    names: list[str] = []
+    for token in mode_values or []:
+        name = MODE_TO_HVAC.get(str(token))
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def profile(device: dict) -> dict | None:
+    """How to control this device, using only the cloud schema."""
+    schema = device.get("_schema") or {}
+    target = _code_dp(schema, "temp_set", "temp_set_c")
+    current = _code_dp(schema, "temp_current", "temp_current_c")
+    mode = _code_dp(schema, "mode")
+    fan = _code_dp(schema, "fan_speed_enum", "fan_speed", "speed")
+    if target or current or mode:
+        kind = "climate"
+    elif fan:
+        kind = "fan"
     else:
-        choices = ["auto", "level1", "level2", "level3"]
+        return None
+    limit = _code_limit(schema, "temp_set", "temp_set_c") or {}
+    current_limit = _code_limit(schema, "temp_current", "temp_current_c") or {}
+    return {
+        "kind": kind,
+        "power": _code_dp(schema, "switch", "switch_led"),
+        "target": target,
+        "current": current,
+        "mode": mode,
+        "mode_values": _code_range(schema, "mode"),
+        "fan": fan,
+        "fan_values": _code_range(schema, "fan_speed_enum", "fan_speed", "speed"),
+        "target_min": limit.get("min"),
+        "target_max": limit.get("max"),
+        "target_step": limit.get("step"),
+        "target_scale": limit.get("scale"),
+        "current_scale": current_limit.get("scale"),
+    }
+
+
+def _parse_spec(raw: Any) -> Any:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or text[:1] not in "{[":
+            return None
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        if any(key in raw for key in ("range", "min", "max")):
+            return raw
+        for key in ("typeSpec", "property", "valueRange"):
+            if key in raw:
+                found = _parse_spec(raw[key])
+                if found is not None:
+                    return found
+    return None
+
+
+def _enum_range(item: dict) -> list[str] | None:
+    for key in ("valueRange", "values", "property", "typeSpec"):
+        parsed = _parse_spec(item.get(key))
+        raw = parsed.get("range") if isinstance(parsed, dict) else parsed
+        if isinstance(raw, list) and raw and all(isinstance(value, str) for value in raw):
+            return [str(value) for value in raw]
+    return None
+
+
+def _number_limit(item: dict) -> dict[str, Any] | None:
+    for key in ("valueRange", "values", "property", "typeSpec"):
+        parsed = _parse_spec(item.get(key))
+        if isinstance(parsed, list) and len(parsed) == 2 and all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) for value in parsed
+        ):
+            return {"min": parsed[0], "max": parsed[1], "step": None, "scale": None}
+        if isinstance(parsed, dict) and ("min" in parsed or "max" in parsed):
+            return {
+                "min": parsed.get("min"),
+                "max": parsed.get("max"),
+                "step": parsed.get("step"),
+                "scale": parsed.get("scale"),
+            }
+    return None
+
+
+def _item_codes(item: dict) -> list[str]:
+    found: list[str] = []
+    for key in ("standardCode", "dpCode", "code", "functionCode"):
+        value = item.get(key)
+        if value and str(value) not in found:
+            found.append(str(value))
+    return found
+
+
+def _item_dp(item: dict, code: str | None) -> str | None:
+    for key in ("dpId", "dp_id"):
+        if item.get(key) is not None:
+            return str(item[key])
+    if isinstance(item.get("id"), int) and item["id"] < 1000:
+        return str(item["id"])
+    maps = item.get("relationDpIdMaps")
+    if isinstance(maps, str):
+        try:
+            maps = json.loads(maps)
+        except json.JSONDecodeError:
+            maps = None
+    if isinstance(maps, dict) and maps:
+        for key, value in maps.items():
+            if code and str(value) == code:
+                return str(key)
+        return str(next(iter(maps)))
+    return None
+
+
+def speed_choices(current: Any, values: list[str] | None = None) -> list[str] | None:
+    """Fan speeds from the cloud enum. The current value is kept visible."""
+    text = "" if current is None else str(current)
+    if not values:
+        return [text] if text else None
+    choices = list(values)
     if text and text not in choices:
         choices.append(text)
     return choices
@@ -234,6 +316,31 @@ def device_ids(payload: Any) -> list[str]:
     return found
 
 
+def schema_field_names(payload: Any) -> str:
+    """Key names of the first cloud schema item. No values."""
+    found: list[str] = []
+
+    def visit(node: Any) -> None:
+        if len(found) >= 4 or not isinstance(node, dict):
+            return
+        for key in (
+            "functionSchemaList",
+            "statusSchemaList",
+            "functionList",
+            "statusList",
+            "schema",
+            "functions",
+            "status",
+        ):
+            items = node.get(key)
+            if isinstance(items, list) and items and isinstance(items[0], dict):
+                names = ",".join(sorted(str(name) for name in items[0])[:16])
+                found.append(f"{key}:{names}")
+
+    _walk(payload, visit)
+    return " | ".join(found) or payload_shape(payload)
+
+
 def payload_shape(payload: Any) -> str:
     """Key names only, so a failed room lookup can be diagnosed without secrets."""
     if isinstance(payload, list):
@@ -275,17 +382,18 @@ def schema_from_payload(payload: Any) -> dict[str, dict[str, str]]:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                code = item.get("code") or item.get("dpCode") or item.get("functionCode")
-                dp = item.get("dpId")
-                if dp is None:
-                    dp = item.get("dp_id")
-                if dp is None and isinstance(item.get("id"), int) and item["id"] < 1000:
-                    dp = item["id"]
-                if code and dp is not None:
-                    codes[str(code)] = str(dp)
-                    enum_range = _enum_range(item)
+                names = _item_codes(item)
+                dp = _item_dp(item, names[0] if names else None)
+                if not names or dp is None:
+                    continue
+                enum_range = _enum_range(item)
+                limit = _number_limit(item)
+                for code in names:
+                    codes[code] = dp
                     if enum_range:
                         codes[f"@range:{code}"] = json.dumps(enum_range, ensure_ascii=False)
+                    if limit and any(value is not None for value in limit.values()):
+                        codes[f"@limit:{code}"] = json.dumps(limit, ensure_ascii=False)
         if codes:
             found[str(product_id)] = codes
 
@@ -299,10 +407,11 @@ def _self_check() -> None:
     assert device_online({}) is None
     assert celsius(26) == 26
     assert celsius(260) == 26.0
+    assert celsius(260, 0) == 260
+    assert celsius(260, 1) == 26.0
     assert celsius(0) is None
     assert celsius(False) is None
-    ac = profile({"category": "kt", "productId": "bb8ial3n"})
-    assert ac["target"] == "2" and ac["current"] == "3" and ac["kind"] == "climate"
+    assert profile({"category": "kt", "productId": "bb8ial3n"}) is None
     heat = profile({"category": "wk", "_schema": {"temp_set": "24", "temp_current": "16"}})
     assert heat["target"] == "24" and heat["current"] == "16"
     rooms = rooms_from_payload(
@@ -330,8 +439,9 @@ def _self_check() -> None:
         [{"productId": "bb8ial3n", "functionList": [{"code": "temp_set", "id": 2}]}]
     )
     assert schema["bb8ial3n"]["temp_set"] == "2"
-    assert speed_choices("level_1") == ["auto", "level_1", "level_2", "level_3", "level_4", "level_5"]
-    assert speed_choices("level1") == ["auto", "level1", "level2", "level3"]
+    assert speed_choices("level_1") == ["level_1"]
+    assert speed_choices("level1") == ["level1"]
+    assert speed_choices(None) is None
     ranged = schema_from_payload(
         [{
             "productId": "bb8ial3n",
@@ -346,6 +456,42 @@ def _self_check() -> None:
     spec = profile({"category": "kt", "_schema": ranged["bb8ial3n"]})
     assert spec["fan_values"][-1] == "level_5"
     assert speed_choices("auto", spec["fan_values"]) == spec["fan_values"]
+    assert speed_choices("level_9", spec["fan_values"])[-1] == "level_9"
+    standard = schema_from_payload(
+        [{
+            "productId": "bb8ial3n",
+            "functionSchemaList": [
+                {
+                    "standardCode": "fan_speed_enum",
+                    "valueRange": "[\"auto\",\"level_1\",\"level_2\",\"level_3\",\"level_4\",\"level_5\"]",
+                    "relationDpIdMaps": {"5": "fan_speed_enum"},
+                },
+                {
+                    "standardCode": "temp_set",
+                    "valueRange": "{\"min\":16,\"max\":32,\"scale\":0,\"step\":1}",
+                    "relationDpIdMaps": {"2": "temp_set"},
+                },
+                {
+                    "standardCode": "mode",
+                    "valueRange": "{\"range\":[\"cold\",\"hot\",\"wind\",\"auto\",\"wet\"]}",
+                    "relationDpIdMaps": {"4": "mode"},
+                },
+            ],
+            "statusSchemaList": [{
+                "dpCode": "temp_current",
+                "valueRange": "{\"min\":-20,\"max\":100,\"scale\":0,\"step\":1}",
+                "relationDpIdMaps": {"3": "temp_current"},
+            }],
+        }]
+    )
+    live = profile({"_schema": standard["bb8ial3n"]})
+    assert live["fan"] == "5" and live["target"] == "2" and live["current"] == "3" and live["mode"] == "4"
+    assert live["fan_values"] == ["auto", "level_1", "level_2", "level_3", "level_4", "level_5"]
+    assert live["target_min"] == 16 and live["target_max"] == 32 and live["target_step"] == 1
+    assert live["target_scale"] == 0 and live["current_scale"] == 0
+    assert cloud_mode_token(live["mode_values"], "cool") == "cold"
+    assert hvac_names(live["mode_values"]) == ["cool", "heat", "fan_only", "auto", "dry"]
+    assert cloud_mode_token(["level1"], "cool") is None
 
 
 if __name__ == "__main__":

@@ -10,7 +10,16 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import XiaohaiConfigEntry
 from .const import DOMAIN
 from .coordinator import XiaohaiCoordinator
-from .dp import HVAC_TO_MODE, MODE_TO_HVAC, celsius, dp_value, profile, speed_choices
+from .dp import (
+    MODE_TO_HVAC,
+    celsius,
+    cloud_mode_token,
+    dp_value,
+    hvac_names,
+    profile,
+    scaled,
+    speed_choices,
+)
 from .entity import XiaohaiEntity, take_new_entities
 
 _HVAC = {
@@ -51,9 +60,6 @@ class XiaohaiClimate(XiaohaiEntity, ClimateEntity):
 
     _attr_name = None
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_target_temperature_step = 1
-    _attr_min_temp = 16
-    _attr_max_temp = 32
 
     def __init__(self, coordinator: XiaohaiCoordinator, dev_id: str) -> None:
         super().__init__(coordinator, dev_id)
@@ -65,19 +71,19 @@ class XiaohaiClimate(XiaohaiEntity, ClimateEntity):
 
     @property
     def icon(self) -> str:
-        return "mdi:radiator" if self.device.get("category") == "wk" else "mdi:air-conditioner"
+        if self._spec.get("mode") or self._spec.get("fan"):
+            return "mdi:air-conditioner"
+        return "mdi:radiator"
 
     @property
     def hvac_modes(self) -> list[HVACMode]:
         if self._spec.get("mode"):
-            return [
-                HVACMode.OFF,
-                HVACMode.COOL,
-                HVACMode.HEAT,
-                HVACMode.DRY,
-                HVACMode.FAN_ONLY,
-                HVACMode.AUTO,
-            ]
+            modes = [HVACMode.OFF]
+            for name in hvac_names(self._spec.get("mode_values")):
+                ha = _HVAC.get(name)
+                if ha and ha not in modes:
+                    modes.append(ha)
+            return modes
         return [HVACMode.OFF, HVACMode.HEAT]
 
     @property
@@ -89,13 +95,24 @@ class XiaohaiClimate(XiaohaiEntity, ClimateEntity):
             features |= ClimateEntityFeature.FAN_MODE
         return features
 
+    def _target_scale(self) -> int | None:
+        scale = self._spec.get("target_scale")
+        return None if scale is None else int(scale)
+
     @property
     def min_temp(self) -> float:
-        return 5 if self.device.get("category") == "wk" else 16
+        shown = scaled(self._spec.get("target_min"), self._target_scale())
+        return super().min_temp if shown is None else shown
 
     @property
     def max_temp(self) -> float:
-        return 35 if self.device.get("category") == "wk" else 32
+        shown = scaled(self._spec.get("target_max"), self._target_scale())
+        return super().max_temp if shown is None else shown
+
+    @property
+    def target_temperature_step(self) -> float:
+        shown = scaled(self._spec.get("target_step"), self._target_scale())
+        return super().target_temperature_step if shown is None else shown
 
     @property
     def hvac_mode(self) -> HVACMode | None:
@@ -105,15 +122,21 @@ class XiaohaiClimate(XiaohaiEntity, ClimateEntity):
         if not self._spec.get("mode"):
             return HVACMode.HEAT if power else HVACMode.OFF
         mapped = MODE_TO_HVAC.get(str(dp_value(self.device, self._spec.get("mode")) or ""))
-        return _HVAC.get(mapped, HVACMode.AUTO)
+        return _HVAC.get(mapped) if mapped else None
+
+    def _reading_scale(self, which: str) -> int | None:
+        scale = self._spec.get(which)
+        if scale is None and which == "current_scale":
+            scale = self._spec.get("target_scale")
+        return None if scale is None else int(scale)
 
     @property
     def current_temperature(self) -> float | None:
-        return celsius(dp_value(self.device, self._spec.get("current")))
+        return celsius(dp_value(self.device, self._spec.get("current")), self._reading_scale("current_scale"))
 
     @property
     def target_temperature(self) -> float | None:
-        return celsius(dp_value(self.device, self._spec.get("target")))
+        return celsius(dp_value(self.device, self._spec.get("target")), self._reading_scale("target_scale"))
 
     @property
     def fan_mode(self) -> str | None:
@@ -135,7 +158,7 @@ class XiaohaiClimate(XiaohaiEntity, ClimateEntity):
             return
         dps: dict = {power: True}
         mode_dp = self._spec.get("mode")
-        cloud = HVAC_TO_MODE.get(hvac_mode)
+        cloud = cloud_mode_token(self._spec.get("mode_values"), hvac_mode)
         if mode_dp and cloud:
             dps[mode_dp] = cloud
         await self.async_publish(dps)
@@ -145,8 +168,16 @@ class XiaohaiClimate(XiaohaiEntity, ClimateEntity):
         if not target or ATTR_TEMPERATURE not in kwargs:
             return
         degrees = float(kwargs[ATTR_TEMPERATURE])
-        raw = dp_value(self.device, target)
-        value: int | float = int(round(degrees * 10)) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 60 else int(round(degrees))
+        scale = self._target_scale()
+        if scale:
+            value: int = int(round(degrees * (10 ** scale)))
+        else:
+            raw = dp_value(self.device, target)
+            value = (
+                int(round(degrees * 10))
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 60
+                else int(round(degrees))
+            )
         await self.async_publish({target: value})
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
@@ -155,7 +186,15 @@ class XiaohaiClimate(XiaohaiEntity, ClimateEntity):
             await self.async_publish({fan: fan_mode})
 
     async def async_turn_on(self) -> None:
-        await self.async_set_hvac_mode(HVACMode.HEAT if not self._spec.get("mode") else HVACMode.AUTO)
+        modes = [mode for mode in self.hvac_modes if mode != HVACMode.OFF]
+        if HVACMode.AUTO in modes:
+            await self.async_set_hvac_mode(HVACMode.AUTO)
+        elif modes:
+            await self.async_set_hvac_mode(modes[0])
+        else:
+            power = self._spec.get("power")
+            if power:
+                await self.async_publish({power: True})
 
     async def async_turn_off(self) -> None:
         await self.async_set_hvac_mode(HVACMode.OFF)
