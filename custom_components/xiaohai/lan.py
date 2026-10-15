@@ -442,7 +442,32 @@ def _read_frame(sock: socket.socket) -> bytes:
     return data
 
 
+def _signed_nonce(data: bytes, raw_key: bytes) -> bytes:
+    """55AA reply: return code, ciphertext, then HMAC over everything before it."""
+    if len(data) < 24 or not data.startswith(PREFIX):
+        return b""
+    length = struct.unpack(">I", data[12:16])[0]
+    frame = data[: 16 + length]
+    payload_len = length - 40
+    if payload_len < 16 or payload_len % 16 or len(frame) < 20 + payload_len + 36:
+        return b""
+    if not frame.endswith(SUFFIX):
+        return b""
+    covered = frame[: 20 + payload_len]
+    mac = frame[20 + payload_len : 52 + payload_len]
+    if hmac.new(raw_key, covered, hashlib.sha256).digest() != mac:
+        return b""
+    try:
+        plain = _unpad(_aes(raw_key, frame[20 : 20 + payload_len], decrypt=True))
+    except Exception:
+        return b""
+    return plain[:16] if len(plain) >= 16 else b""
+
+
 def _remote_nonce(data: bytes, raw_key: bytes, nonce: bytes) -> tuple[bytes, bytes] | None:
+    signed = _signed_nonce(data, raw_key)
+    if signed:
+        return signed, raw_key
     if len(data) < 24 or not data.startswith(PREFIX):
         return None
     length = struct.unpack(">I", data[12:16])[0]
@@ -670,7 +695,8 @@ def _clue(ip: str, keys: list[bytes]) -> str:
     command, length = struct.unpack(">II", data[8:16])
     frame = data[: 16 + length]
     body = frame[16:-8] if len(frame) >= 24 and frame.endswith(SUFFIX) else b""
-    return f"{newer_note} 会话回{len(data)} 命令{command} 长度{length} {_census(body, keys)}"
+    signed = sum(1 for key in dict.fromkeys(keys) if _signed_nonce(data, key))
+    return f"{newer_note} 会话回{len(data)} 命令{command} 长度{length} 帧内校验{signed} {_census(body, keys)}"
 
 
 def _publish_35(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any]) -> str:
@@ -940,6 +966,11 @@ def _self_check() -> None:
     assert unpack_35(sealed, sample) == (3, sample)
     assert unpack_35(sealed, b"abcdef0123456789") is None
     assert len(_gcm(sample, b"0123456789ab", sample, b"")) == 32
+    cipher = _aes(sample, _pad(sample))
+    covered = PREFIX + struct.pack(">III", 1, 3, 40 + len(cipher)) + b"\x00\x00\x00\x00" + cipher
+    reply = covered + hmac.new(sample, covered, hashlib.sha256).digest() + SUFFIX
+    assert _signed_nonce(reply, sample) == sample
+    assert _signed_nonce(reply, b"abcdef0123456789") == b""
     print("lan self-check ok")
 
 
