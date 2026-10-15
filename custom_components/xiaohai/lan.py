@@ -782,14 +782,28 @@ def _crc_ok(data: bytes, key: bytes) -> bool:
     return plain.startswith(b"{") and b"unvalid" not in plain and b"error" not in plain.lower()
 
 
-def _swap_frames(raw_key: bytes, nonce: bytes, remote: bytes, plain: bytes) -> tuple[bytes, bytes]:
-    """Command 5 is the 32-byte HMAC of the gateway nonce, then control uses the swapped key."""
+def _signed_code(data: bytes, key: bytes) -> int | None:
+    """Return code from a signed reply. None when the signature does not match."""
+    if len(data) < 20 or not data.startswith(PREFIX):
+        return None
+    length = struct.unpack(">I", data[12:16])[0]
+    frame = data[: 16 + length]
+    if len(frame) < 52 or not frame.endswith(SUFFIX):
+        return None
+    if hmac.new(key, frame[:-36], hashlib.sha256).digest() != frame[-36:-4]:
+        return None
+    return struct.unpack(">I", frame[16:20])[0]
+
+
+def _swap_frames(raw_key: bytes, nonce: bytes, remote: bytes, plain: bytes) -> tuple[bytes, bytes, bytes]:
+    """Command 5 carries the HMAC of the gateway nonce. Control uses the swapped key."""
     finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
     mixed = bytes(left ^ right for left, right in zip(nonce, remote))
     session = _aes(raw_key, mixed)
-    blob = pack_signed(2, 5, _aes(raw_key, finish), raw_key)
-    blob += pack_signed(3, CONTROL_NEW, _aes(session, _pad(plain)), session)
-    return blob, session
+    # aes128_ecb_encode adds a PKCS7 block even when the 32-byte HMAC already fills one.
+    done = pack_signed(2, 5, _aes(raw_key, _pad(finish)), raw_key)
+    command = pack_signed(3, CONTROL_NEW, _aes(session, _pad(plain)), session)
+    return done, command, session
 
 
 def _frame_command(data: bytes) -> int:
@@ -816,8 +830,12 @@ def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain
         remote = _signed_nonce(_read_frame(sock), raw_key)
         if len(remote) != 16:
             return "会话失败"
-        blob, session = _swap_frames(raw_key, nonce, remote, wrapped)
-        sock.sendall(blob)
+        done, command, session = _swap_frames(raw_key, nonce, remote, wrapped)
+        sock.sendall(done)
+        step = _read_frame(sock, 2.5)
+        if _signed_code(step, raw_key) != 0:
+            return "网关未确认 " + _shape(step, raw_key)
+        sock.sendall(command)
         first = _read_frame(sock, 2.5)
         try:
             second = _read_frame(sock, 1.2)
@@ -1068,17 +1086,17 @@ def _self_check() -> None:
     assert _signed_nonce(reply, b"abcdef0123456789") == b""
     command = _local_command(sample, b"hello")
     assert struct.unpack(">I", command[8:12])[0] == CONTROL_NEW
-    swapped, session = _swap_frames(sample, sample, sample, b"3.4" + (b"\x00" * 12) + b"{}")
-    assert struct.unpack(">I", swapped[8:12])[0] == 5
-    assert len(_aes(sample, hmac.new(sample, sample, hashlib.sha256).digest())) == 32
+    done, command, session = _swap_frames(sample, sample, sample, b"3.4" + (b"\x00" * 12) + b"{}")
+    assert struct.unpack(">I", done[8:12])[0] == 5
+    assert struct.unpack(">I", done[12:16])[0] == 48 + 36
     assert len(session) == 16
-    second = swapped.find(PREFIX, 4)
-    assert struct.unpack(">I", swapped[second + 8 : second + 12])[0] == CONTROL_NEW
+    assert struct.unpack(">I", command[8:12])[0] == CONTROL_NEW
     ok = PREFIX + struct.pack(">IIII", 1, CONTROL_NEW, 4 + 16 + 36, 0) + (b"\x11" * 16)
     ok += hmac.new(sample, ok, hashlib.sha256).digest() + SUFFIX
     bad = PREFIX + struct.pack(">IIII", 1, CONTROL_NEW, 4 + 16 + 36, 1) + (b"\x11" * 16)
     bad += hmac.new(sample, bad, hashlib.sha256).digest() + SUFFIX
     assert _accepted(ok, sample)
+    assert _signed_code(ok, sample) == 0 and _signed_code(bad, sample) == 1
     assert not _accepted(bad, sample)
     assert not _accepted(ok, b"abcdef0123456789")
     assert not _accepted(b"", sample)
