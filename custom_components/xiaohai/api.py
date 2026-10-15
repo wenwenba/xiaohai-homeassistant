@@ -152,6 +152,9 @@ class XiaohaiClient:
             ("tuya.m.my.group.device.relation.list", "2.0", None),
             ("tuya.m.my.group.device.relation.list", "2.0", {"gid": int(gid)}),
             ("tuya.m.location.get", "3.1", {"gid": int(gid)}),
+            ("tuya.m.device.relation.list", "1.0", {"parentId": gid_s, "parentType": 2}),
+            ("tuya.m.device.relation.entity.list", "1.0", {"parentId": gid_s, "parentType": 2}),
+            ("tuya.m.device.relation.list", "3.0", {"parentId": gid_s, "parentType": 2}),
         )
         notes: list[str] = []
         for action, version, payload in attempts:
@@ -167,19 +170,28 @@ class XiaohaiClient:
                 self._room_source = "bulk"
                 self.last_room_note = ""
                 return found
-            notes.append(f"{action} {version}: {payload_shape(result)}")
+            name_ids = ",".join(f"{key}:{value}" for key, value in list(names.items())[:8])
+            notes.append(f"{action} {version}: {payload_shape(result)} names={name_ids}")
         mapped: dict[str, str] = {}
+        entity_version = "1.0"
         for room_id, room_name in names.items():
-            try:
-                result = await self._request(
-                    "tuya.m.device.relation.entity.list",
-                    {"parentId": str(room_id), "parentType": 4},
-                    extra_params={"gid": gid_s},
-                )
-            except XiaohaiError as err:
-                notes.append(f"entity.list: {err}")
-                break
-            ids = device_ids(result)
+            ids: list[str] = []
+            result: Any = None
+            for version in (entity_version, "2.0", "3.0"):
+                try:
+                    result = await self._request(
+                        "tuya.m.device.relation.entity.list",
+                        {"parentId": str(room_id), "parentType": 4},
+                        extra_params={"gid": gid_s},
+                        version=version,
+                    )
+                except XiaohaiError as err:
+                    notes.append(f"entity.list {version}: {err}")
+                    continue
+                ids = device_ids(result)
+                if ids:
+                    entity_version = version
+                    break
             if ids:
                 mapped.update({dev_id: room_name for dev_id in ids})
             else:

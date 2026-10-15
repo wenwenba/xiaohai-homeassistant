@@ -179,10 +179,17 @@ def payload_shape(payload: Any) -> str:
     """Key names only, so a failed room lookup can be diagnosed without secrets."""
     if isinstance(payload, list):
         head = payload_shape(payload[0]) if payload else "-"
-        return f"list {len(payload)} {head}"
+        rooms = ",".join(
+            f"{item.get('bizType')}:{item.get('roomId')}"
+            for item in payload[:6]
+            if isinstance(item, dict) and "roomId" in item
+        )
+        return f"list {len(payload)} {head} roomId[{rooms}]"
     if isinstance(payload, dict):
-        return ",".join(sorted(payload)[:12])
-    return type(payload).__name__
+        return ",".join(sorted(str(key) for key in payload)[:12]) or "{}"
+    if isinstance(payload, str):
+        return f"str {len(payload)}"
+    return repr(payload)[:40]
 
 
 def schema_from_payload(payload: Any) -> dict[str, dict[str, str]]:
