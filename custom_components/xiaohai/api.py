@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
-from .dp import payload_shape, rooms_from_payload, rooms_from_relation, schema_from_payload
+from .dp import payload_shape, rooms_from_payload, schema_from_payload
 
 
 class XiaohaiError(Exception):
@@ -153,21 +153,6 @@ class XiaohaiClient:
         if found:
             self.last_room_note = ""
             return found
-        relation_note = ""
-        try:
-            relation = await self._request(
-                "tuya.m.my.group.device.relation.list",
-                None,
-                extra_params={"gid": gid_s},
-                version="2.0",
-            )
-        except XiaohaiError as err:
-            relation = None
-            relation_note = str(err)
-        found = rooms_from_relation(relation, names)
-        if found:
-            self.last_room_note = ""
-            return found
         try:
             listed_devices = await self._request(
                 "tuya.m.my.group.device.sort.list",
@@ -183,10 +168,7 @@ class XiaohaiClient:
             self.last_room_note = ""
             return found
         name_ids = ",".join(f"{key}:{value}" for key, value in list(names.items())[:8])
-        self.last_room_note = (
-            f"relation {payload_shape(relation)} {relation_note} "
-            f"sort.list {payload_shape(listed_devices)} names={name_ids}"
-        )
+        self.last_room_note = f"sort.list {payload_shape(listed_devices)} names={name_ids}"
         return {}
 
     async def async_product_schema(self, gid: Any) -> dict[str, dict[str, str]]:

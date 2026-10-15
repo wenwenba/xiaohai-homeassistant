@@ -133,37 +133,6 @@ def _walk(node: Any, visit) -> None:
             _walk(value, visit)
 
 
-def rooms_from_relation(payload: Any, names: dict[str, str]) -> dict[str, str]:
-    """devId -> room name from tuya.m.my.group.device.relation.list.
-
-    The app reads key ``4`` as rooms. Each room's devices are ``children["6"]``.
-    """
-    if isinstance(payload, str) and payload[:1] in "{[":
-        try:
-            payload = json.loads(payload)
-        except json.JSONDecodeError:
-            return {}
-    if isinstance(payload, dict) and "relation" in payload and "4" not in payload:
-        return rooms_from_relation(payload.get("relation"), names)
-    rooms = payload.get("4") if isinstance(payload, dict) else None
-    if not isinstance(rooms, list):
-        return {}
-    found: dict[str, str] = {}
-    for room in rooms:
-        if not isinstance(room, dict) or room.get("id") is None:
-            continue
-        name = names.get(str(room["id"]))
-        children = room.get("children") if name else None
-        devices = children.get("6") if isinstance(children, dict) else None
-        if not isinstance(devices, list):
-            continue
-        for item in devices:
-            dev_id = item.get("id") if isinstance(item, dict) else item
-            if isinstance(dev_id, str) and len(dev_id) > 8:
-                found[dev_id] = name
-    return found
-
-
 def rooms_from_payload(payload: Any, names: dict[str, str]) -> dict[str, str]:
     """Pull devId -> room name out of sort, relation, or location payloads."""
     found: dict[str, str] = {}
@@ -301,11 +270,6 @@ def _self_check() -> None:
         {"45684092": "客厅"},
     )
     assert rooms == {"dev1": "客厅"}
-    relation = rooms_from_relation(
-        {"4": [{"id": 45684092, "children": {"6": [{"id": "6c8c9339b6331381ec7a79"}]}}]},
-        {"45684092": "客厅"},
-    )
-    assert relation == {"6c8c9339b6331381ec7a79": "客厅"}
     nested = rooms_from_payload(
         {"rooms": [{"name": "主卧", "deviceList": [{"devId": "dev12345678"}]}]},
         {},
