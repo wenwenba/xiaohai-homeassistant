@@ -13,7 +13,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import CONF_COUNTRY_CODE, DOMAIN, PLATFORMS
-from .coordinator import XiaohaiCoordinator, async_assign_areas
+from .coordinator import XiaohaiCoordinator, async_assign_areas, async_sync_devices
 
 type XiaohaiConfigEntry = ConfigEntry
 
@@ -38,8 +38,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: XiaohaiConfigEntry) -> b
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    async_assign_areas(hass, coordinator.data)
-    entry.async_on_unload(coordinator.async_add_listener(lambda: async_assign_areas(hass, coordinator.data)))
+
+    def _apply_device_list() -> None:
+        async_sync_devices(hass, entry.entry_id, coordinator.data)
+        async_assign_areas(hass, coordinator.data)
+
+    _apply_device_list()
+    entry.async_on_unload(coordinator.async_add_listener(_apply_device_list))
+    entry.async_on_unload(coordinator.async_shutdown)
     _remove_legacy_switches(hass, entry.entry_id)
     if hass.services.has_service("persistent_notification", "dismiss"):
         await hass.services.async_call(

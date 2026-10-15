@@ -11,6 +11,23 @@ from .coordinator import XiaohaiCoordinator
 from .dp import CATEGORY_LABEL
 
 
+def take_new_entities(coordinator: XiaohaiCoordinator, known: set[str], factory):
+    """Entities for devices that just showed up. Devices that left are forgotten."""
+    data = coordinator.data or {}
+    added = []
+    for dev_id, device in data.items():
+        if dev_id in known:
+            continue
+        entity = factory(dev_id, device)
+        if entity is None:
+            continue
+        known.add(dev_id)
+        added.append(entity)
+    for dev_id in [dev_id for dev_id in known if dev_id not in data]:
+        known.discard(dev_id)
+    return added
+
+
 class XiaohaiEntity(CoordinatorEntity[XiaohaiCoordinator]):
     """One Xiaohai device."""
 

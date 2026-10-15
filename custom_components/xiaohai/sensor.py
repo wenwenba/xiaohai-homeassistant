@@ -11,7 +11,7 @@ from . import XiaohaiConfigEntry
 from .const import DOMAIN
 from .coordinator import XiaohaiCoordinator
 from .dp import celsius, dp_value, profile
-from .entity import XiaohaiEntity
+from .entity import XiaohaiEntity, take_new_entities
 
 
 async def async_setup_entry(
@@ -23,20 +23,18 @@ async def async_setup_entry(
     coordinator: XiaohaiCoordinator = hass.data[DOMAIN][entry.entry_id]
     known: set[str] = set()
 
+    def _build(dev_id: str, device: dict) -> XiaohaiTemperature | None:
+        spec = profile(device)
+        if not spec or not spec.get("current"):
+            return None
+        return XiaohaiTemperature(coordinator, dev_id)
+
     def _add_new() -> None:
-        added = []
-        for dev_id, device in coordinator.data.items():
-            if dev_id in known:
-                continue
-            spec = profile(device)
-            if not spec or not spec.get("current"):
-                continue
-            known.add(dev_id)
-            added.append(XiaohaiTemperature(coordinator, dev_id))
+        added = take_new_entities(coordinator, known, _build)
         if added:
             async_add_entities(added)
 
-    coordinator.async_add_listener(_add_new)
+    entry.async_on_unload(coordinator.async_add_listener(_add_new))
     _add_new()
 
 

@@ -175,6 +175,14 @@ def rooms_from_payload(payload: Any, names: dict[str, str]) -> dict[str, str]:
     return found
 
 
+def device_id_from_unique_id(unique_id: str) -> str | None:
+    """Device id stored in an entity unique id, before the entity suffix."""
+    for suffix in ("_climate", "_temperature", "_online", "_fan"):
+        if unique_id.endswith(suffix):
+            return unique_id[: -len(suffix)]
+    return None
+
+
 def device_ids(payload: Any) -> list[str]:
     """Device ids inside a room-membership response."""
     found: list[str] = []
@@ -276,6 +284,8 @@ def _self_check() -> None:
     )
     assert detail == {"6c8c9339b6331381ec7a79": "客厅"}
     assert device_ids([{"bizId": "abcdef123456"}]) == ["abcdef123456"]
+    assert device_id_from_unique_id("6c8c9339b6331381ec7a79_climate") == "6c8c9339b6331381ec7a79"
+    assert device_id_from_unique_id("6c8c9339b6331381ec7a79_online") == "6c8c9339b6331381ec7a79"
     schema = schema_from_payload(
         [{"productId": "bb8ial3n", "functionList": [{"code": "temp_set", "id": 2}]}]
     )

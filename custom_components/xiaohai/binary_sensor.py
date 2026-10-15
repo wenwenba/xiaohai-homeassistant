@@ -10,7 +10,7 @@ from . import XiaohaiConfigEntry
 from .const import DOMAIN
 from .coordinator import XiaohaiCoordinator
 from .dp import device_online
-from .entity import XiaohaiEntity
+from .entity import XiaohaiEntity, take_new_entities
 
 
 async def async_setup_entry(
@@ -23,16 +23,15 @@ async def async_setup_entry(
     known: set[str] = set()
 
     def _add_new() -> None:
-        added = [
-            XiaohaiOnlineSensor(coordinator, dev_id)
-            for dev_id in coordinator.data
-            if dev_id not in known
-        ]
-        known.update(dev_id for dev_id in coordinator.data)
+        added = take_new_entities(
+            coordinator,
+            known,
+            lambda dev_id, _device: XiaohaiOnlineSensor(coordinator, dev_id),
+        )
         if added:
             async_add_entities(added)
 
-    coordinator.async_add_listener(_add_new)
+    entry.async_on_unload(coordinator.async_add_listener(_add_new))
     _add_new()
 
 
