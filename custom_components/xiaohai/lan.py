@@ -368,21 +368,23 @@ def _remote_nonce(data: bytes, raw_key: bytes, nonce: bytes) -> bytes:
     frame = data[: 16 + length]
     if len(frame) < 24 or not frame.endswith(SUFFIX):
         return b""
-    if struct.unpack(">I", frame[8:12])[0] != 4:
+    if struct.unpack(">I", frame[8:12])[0] not in {3, 4}:
         return b""
     blobs = [frame[16:-8]]
     if len(frame) >= 52:
         blobs.insert(0, frame[16:-36])
     check = hmac.new(raw_key, nonce, hashlib.sha256).digest()
     for blob in blobs:
+        plains = [blob] if len(blob) >= 48 else []
         chunks = (blob[4:], blob) if len(blob) > 4 else (blob,)
         for chunk in chunks:
             if not chunk or len(chunk) % 16:
                 continue
             try:
-                plain = _unpad(_aes(raw_key, chunk, decrypt=True))
+                plains.append(_unpad(_aes(raw_key, chunk, decrypt=True)))
             except Exception:
                 continue
+        for plain in plains:
             if len(plain) >= 48 and plain[16:48] == check:
                 return plain[:16]
     return b""
