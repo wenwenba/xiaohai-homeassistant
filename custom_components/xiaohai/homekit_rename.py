@@ -23,25 +23,32 @@ _NAME_LIMIT = 64
 
 
 def _remember_name(accessory: object, value: object) -> None:
-    """Store a Home app rename on the existing entity."""
-    hass = getattr(accessory, "hass", None)
-    entity_id = getattr(accessory, "entity_id", None)
-    if hass is None or not entity_id or not isinstance(value, str):
-        return
-    name = value.strip()[:_NAME_LIMIT]
-    if not name:
-        return
-    state = hass.states.get(entity_id)
-    if state is not None and state.name == name:
-        return
+    """Store a Home app rename on the existing entity.
 
-    async def _store() -> None:
-        registry = er.async_get(hass)
-        if registry.async_get(entity_id) is None:
+    A failure here must not fail the HomeKit write, or the Home app will
+    reject the room change as well.
+    """
+    try:
+        hass = getattr(accessory, "hass", None)
+        entity_id = getattr(accessory, "entity_id", None)
+        if hass is None or not entity_id or not isinstance(value, str):
             return
-        registry.async_update_entity(entity_id, name=name)
+        name = value.strip()[:_NAME_LIMIT]
+        if not name:
+            return
+        state = hass.states.get(entity_id)
+        if state is not None and state.name == name:
+            return
 
-    hass.async_create_task(_store())
+        async def _store() -> None:
+            registry = er.async_get(hass)
+            if registry.async_get(entity_id) is None:
+                return
+            registry.async_update_entity(entity_id, name=name)
+
+        hass.add_job(_store)
+    except Exception:
+        _LOGGER.debug("未能记下家庭 App 里的新名称", exc_info=True)
 
 
 def _attach_configured_name(accessory: object, service: object) -> None:
