@@ -139,22 +139,28 @@ def rooms_from_payload(payload: Any, names: dict[str, str]) -> dict[str, str]:
 
     def visit(node: dict) -> None:
         dev = node.get("bizId") or node.get("devId")
-        if dev and isinstance(node.get("roomName"), str) and node["roomName"]:
-            found[str(dev)] = node["roomName"]
+        room_name = node.get("roomName")
+        if isinstance(room_name, str) and room_name:
+            ident = dev or node.get("id")
+            if isinstance(ident, str) and len(ident) > 8:
+                found[ident] = room_name
         room_id = node.get("roomId")
-        if dev and room_id not in (None, "", 0, "0"):
-            room_name = names.get(str(room_id))
-            if room_name:
-                found[str(dev)] = room_name
-        if not node.get("name"):
+        if dev and room_id not in (None, "", 0, "0", -1, "-1"):
+            named = names.get(str(room_id))
+            if named:
+                found[str(dev)] = named
+        if not isinstance(node.get("name"), str):
             return
-        for key in ("deviceIds", "devIds"):
+        for key in ("deviceIds", "devIds", "deviceList", "devices"):
             ids = node.get(key)
             if not isinstance(ids, list):
                 continue
             for item in ids:
-                dev_id = item.get("devId") if isinstance(item, dict) else item
-                if isinstance(dev_id, str):
+                if isinstance(item, dict):
+                    dev_id = item.get("devId") or item.get("bizId") or item.get("id")
+                else:
+                    dev_id = item
+                if isinstance(dev_id, str) and len(dev_id) > 8:
                     found[dev_id] = node["name"]
 
     _walk(payload, visit)
@@ -248,6 +254,11 @@ def _self_check() -> None:
         {"45684092": "客厅"},
     )
     assert rooms == {"dev1": "客厅"}
+    nested = rooms_from_payload(
+        {"rooms": [{"name": "主卧", "deviceList": [{"devId": "dev12345678"}]}]},
+        {},
+    )
+    assert nested == {"dev12345678": "主卧"}
     assert device_ids([{"bizId": "abcdef123456"}]) == ["abcdef123456"]
     schema = schema_from_payload(
         [{"productId": "bb8ial3n", "functionList": [{"code": "temp_set", "id": 2}]}]
