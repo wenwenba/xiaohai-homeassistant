@@ -206,23 +206,51 @@ def _item_codes(item: dict) -> list[str]:
     return found
 
 
-def _item_dp(item: dict, code: str | None) -> str | None:
-    for key in ("dpId", "dp_id"):
-        if item.get(key) is not None:
-            return str(item[key])
-    if isinstance(item.get("id"), int) and item["id"] < 1000:
-        return str(item["id"])
+def _is_dp_id(value: Any) -> bool:
+    if isinstance(value, bool) or isinstance(value, float):
+        return False
+    if isinstance(value, int):
+        return 0 <= value < 1000
+    return isinstance(value, str) and value.isdigit() and int(value) < 1000
+
+
+def _as_dp_id(value: Any) -> str:
+    return str(int(value)) if isinstance(value, int) else str(value)
+
+
+def _relation_map(item: dict) -> dict | None:
     maps = item.get("relationDpIdMaps")
     if isinstance(maps, str):
         try:
             maps = json.loads(maps)
         except json.JSONDecodeError:
-            maps = None
-    if isinstance(maps, dict) and maps:
-        for key, value in maps.items():
-            if code and str(value) == code:
-                return str(key)
-        return str(next(iter(maps)))
+            return None
+    return maps if isinstance(maps, dict) and maps else None
+
+
+def _item_dp(item: dict, code: str | None) -> str | None:
+    for key in ("dpId", "dp_id"):
+        if _is_dp_id(item.get(key)):
+            return _as_dp_id(item[key])
+    if _is_dp_id(item.get("id")):
+        return _as_dp_id(item["id"])
+    maps = _relation_map(item)
+    if not maps:
+        return None
+    for key, value in maps.items():
+        if code and str(key) == code and _is_dp_id(value):
+            return _as_dp_id(value)
+        if code and str(value) == code and _is_dp_id(key):
+            return _as_dp_id(key)
+    numeric: list[str] = []
+    for key, value in maps.items():
+        for side in (key, value):
+            if _is_dp_id(side):
+                text = _as_dp_id(side)
+                if text not in numeric:
+                    numeric.append(text)
+    if len(numeric) == 1:
+        return numeric[0]
     return None
 
 
@@ -334,8 +362,16 @@ def schema_field_names(payload: Any) -> str:
         ):
             items = node.get(key)
             if isinstance(items, list) and items and isinstance(items[0], dict):
-                names = ",".join(sorted(str(name) for name in items[0])[:16])
-                found.append(f"{key}:{names}")
+                item = items[0]
+                names = ",".join(sorted(str(name) for name in item)[:16])
+                maps = item.get("relationDpIdMaps")
+                strategy = item.get("strategyCode")
+                raw_strategy = item.get("strategyValue")
+                if not isinstance(raw_strategy, str):
+                    raw_strategy = ""
+                elif len(raw_strategy) > 240:
+                    raw_strategy = raw_strategy[:240] + "..."
+                found.append(f"{key}:{names} map[{maps}] strategy[{strategy}] rule[{raw_strategy}]")
 
     _walk(payload, visit)
     return " | ".join(found) or payload_shape(payload)
@@ -486,6 +522,19 @@ def _self_check() -> None:
     )
     live = profile({"_schema": standard["bb8ial3n"]})
     assert live["fan"] == "5" and live["target"] == "2" and live["current"] == "3" and live["mode"] == "4"
+    flipped = schema_from_payload(
+        [{
+            "productId": "bb8ial3n",
+            "functionSchemaList": [{
+                "standardCode": "fan_speed_enum",
+                "valueRange": "{\"range\":[\"auto\",\"low\",\"middle\",\"high\"]}",
+                "relationDpIdMaps": {"fan_speed_enum": 5},
+            }],
+        }]
+    )
+    flipped_spec = profile({"_schema": flipped["bb8ial3n"]})
+    assert flipped_spec["fan"] == "5"
+    assert flipped_spec["fan_values"] == ["auto", "low", "middle", "high"]
     assert live["fan_values"] == ["auto", "level_1", "level_2", "level_3", "level_4", "level_5"]
     assert live["target_min"] == 16 and live["target_max"] == 32 and live["target_step"] == 1
     assert live["target_scale"] == 0 and live["current_scale"] == 0
