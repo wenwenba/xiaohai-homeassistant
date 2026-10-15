@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
-from .dp import device_ids, payload_shape, rooms_from_payload, schema_from_payload
+from .dp import payload_shape, rooms_from_payload, schema_from_payload
 
 
 class XiaohaiError(Exception):
@@ -66,7 +66,6 @@ class XiaohaiClient:
         self._country_code = country_code.strip() or "86"
         self._sid: str | None = None
         self.last_room_note = ""
-        self._room_source = ""
 
     @property
     def uses_email(self) -> bool:
@@ -134,7 +133,11 @@ class XiaohaiClient:
         return devices
 
     async def async_device_rooms(self, gid: Any) -> dict[str, str]:
-        """Map devId to the cloud room name. The app reads rooms[].ids from home.m.detail."""
+        """Map devId to the cloud room name.
+
+        shortcut: only the room list and the device sort list. A roomId of -1
+        means the app has not placed that device in a room.
+        """
         gid_s = str(gid)
         listed = await self._request(
             "tuya.m.room.list",
@@ -148,84 +151,25 @@ class XiaohaiClient:
         }
         found = rooms_from_payload(listed, names)
         if found:
-            self._room_source = "list"
             self.last_room_note = ""
             return found
-        notes: list[str] = []
-        if self._room_source in ("", "detail"):
-            try:
-                detail = await self._request(
-                    "home.m.detail",
-                    {"homeId": gid_s},
-                    extra_params={"gid": gid_s},
-                    version="1.0",
-                )
-            except XiaohaiError as err:
-                notes.append(f"home.m.detail 1.0: {err}")
-            else:
-                found = rooms_from_payload(detail, names)
-                if found:
-                    self._room_source = "detail"
-                    self.last_room_note = ""
-                    return found
-                name_ids = ",".join(f"{key}:{value}" for key, value in list(names.items())[:8])
-                notes.append(f"home.m.detail 1.0: {payload_shape(detail)} names={name_ids}")
-            if self._room_source == "detail":
-                self.last_room_note = " | ".join(notes)[:800]
-                return {}
-        attempts = () if self._room_source == "entity" else (
-            ("tuya.m.my.group.device.sort.list", "1.0", {"gid": gid_s}),
-            ("tuya.m.my.group.device.sort.list", "1.0", {"gid": int(gid)}),
-            ("tuya.m.my.group.device.relation.list", "2.0", None),
-            ("tuya.m.my.group.device.relation.list", "2.0", {"gid": int(gid)}),
-            ("tuya.m.location.get", "3.1", {"gid": int(gid)}),
-            ("tuya.m.device.relation.list", "1.0", {"parentId": gid_s, "parentType": 2}),
-            ("tuya.m.device.relation.entity.list", "1.0", {"parentId": gid_s, "parentType": 2}),
-            ("tuya.m.device.relation.list", "3.0", {"parentId": gid_s, "parentType": 2}),
-        )
-        for action, version, payload in attempts:
-            try:
-                result = await self._request(
-                    action, payload, extra_params={"gid": gid_s}, version=version
-                )
-            except XiaohaiError as err:
-                notes.append(f"{action} {version}: {err}")
-                continue
-            found = rooms_from_payload(result, names)
-            if found:
-                self._room_source = "bulk"
-                self.last_room_note = ""
-                return found
-            name_ids = ",".join(f"{key}:{value}" for key, value in list(names.items())[:8])
-            notes.append(f"{action} {version}: {payload_shape(result)} names={name_ids}")
-        mapped: dict[str, str] = {}
-        entity_version = "1.0"
-        for room_id, room_name in names.items():
-            ids: list[str] = []
-            result: Any = None
-            for version in (entity_version, "2.0", "3.0"):
-                try:
-                    result = await self._request(
-                        "tuya.m.device.relation.entity.list",
-                        {"parentId": str(room_id), "parentType": 4},
-                        extra_params={"gid": gid_s},
-                        version=version,
-                    )
-                except XiaohaiError as err:
-                    notes.append(f"entity.list {version}: {err}")
-                    continue
-                ids = device_ids(result)
-                if ids:
-                    entity_version = version
-                    break
-            if ids:
-                mapped.update({dev_id: room_name for dev_id in ids})
-            else:
-                notes.append(f"entity.list {room_name}: {payload_shape(result)}")
-        if mapped:
-            self._room_source = "entity"
-        self.last_room_note = "" if mapped else " | ".join(notes)[:800]
-        return mapped
+        try:
+            listed_devices = await self._request(
+                "tuya.m.my.group.device.sort.list",
+                {"gid": gid_s},
+                extra_params={"gid": gid_s},
+                version="1.0",
+            )
+        except XiaohaiError as err:
+            self.last_room_note = str(err)
+            return {}
+        found = rooms_from_payload(listed_devices, names)
+        if found:
+            self.last_room_note = ""
+            return found
+        name_ids = ",".join(f"{key}:{value}" for key, value in list(names.items())[:8])
+        self.last_room_note = f"sort.list {payload_shape(listed_devices)} names={name_ids}"
+        return {}
 
     async def async_product_schema(self, gid: Any) -> dict[str, dict[str, str]]:
         """Map productId to datapoint code -> dp id, when the cloud has a schema."""
