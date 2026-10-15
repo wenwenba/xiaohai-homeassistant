@@ -20,6 +20,7 @@ class XiaohaiConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input: dict | None = None) -> ConfigFlowResult:
         """Ask for the Xiaohai account."""
         errors: dict[str, str] = {}
+        placeholders: dict[str, str] = {}
         if user_input is not None:
             username = user_input[CONF_USERNAME].strip()
             await self.async_set_unique_id(username)
@@ -34,8 +35,9 @@ class XiaohaiConfigFlow(ConfigFlow, domain=DOMAIN):
                 await client.async_login()
             except XiaohaiAuthError:
                 errors["base"] = "invalid_auth"
-            except XiaohaiError:
+            except XiaohaiError as err:
                 errors["base"] = "cannot_connect"
+                placeholders["error"] = str(err)
             else:
                 return self.async_create_entry(
                     title=username,
@@ -56,4 +58,5 @@ class XiaohaiConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+            description_placeholders=placeholders or None,
         )

@@ -13,7 +13,7 @@
     },
     "error": {
       "invalid_auth": "Incorrect account or password",
-      "cannot_connect": "Cannot reach the Xiaohai cloud, or the cloud rejected the signature",
+      "cannot_connect": "Cannot reach the Xiaohai cloud: {error}",
       "unknown": "Unexpected error"
     },
     "abort": {

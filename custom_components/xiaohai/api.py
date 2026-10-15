@@ -10,7 +10,7 @@ from typing import Any
 
 import aiohttp
 
-from .const import API_URL, API_VERSION, APP_SECRET, CLIENT_ID, USER_AGENT
+from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
 
 
 class XiaohaiError(Exception):
@@ -37,13 +37,12 @@ def encrypt_password(public_key: str, exponent: str, password: str) -> str:
     return _plain_rsa_encrypt(int(public_key), int(exponent), password_hash).hex()
 
 
-def sign_request(data: dict[str, str], secret: str = APP_SECRET) -> str:
-    """Sign a mobile API request.
+def sign_request(data: dict[str, str], secret: str = SIGN_KEY) -> str:
+    """Sign a mobile API request the way libjnimain does.
 
-    postData is replaced by the swapped MD5 used in TuyaApiSignManager.
-    The remaining string is HMAC-SHA256 keyed with the app secret, which is
-    the signer used by the public OEM mobile client against the same action
-    names. The app itself finishes the hash inside a native library.
+    Sorted fields are joined with ``||``. postData is the swapped MD5 from
+    TuyaApiSignManager. The native library then HMACs that string with
+    ``A_<bmp key>_<app secret>`` and returns lowercase hex.
     """
     parts: list[str] = []
     for key in sorted(data):
@@ -164,27 +163,25 @@ class XiaohaiClient:
         if require_sid and not self._sid:
             await self.async_login()
 
-        params: dict[str, str] = {
+        form: dict[str, str] = {
             "a": action,
             "clientId": CLIENT_ID,
             "v": API_VERSION,
             "time": str(int(time.time())),
+            "et": ET_VERSION,
         }
         if extra_params:
-            params.update(extra_params)
+            form.update(extra_params)
         if require_sid and self._sid:
-            params["sid"] = self._sid
-
-        data: dict[str, str] = {}
+            form["sid"] = self._sid
         if payload is not None:
-            data["postData"] = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+            form["postData"] = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
-        params["sign"] = sign_request({**params, **data})
+        form["sign"] = sign_request(form)
         try:
             async with self._session.post(
                 API_URL,
-                params=params,
-                data=data,
+                data=form,
                 headers={"User-Agent": USER_AGENT},
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
@@ -199,7 +196,7 @@ class XiaohaiClient:
 
         code = str(body.get("errorCode") or "")
         message = str(body.get("errorMsg") or code or "未知错误")
-        if code in {"USER_SESSION_INVALID", "SING_VALIDATE_FALED_4", "SING_VALIDATE_FALED"} and retry and require_sid:
+        if code in {"USER_SESSION_INVALID", "USER_SESSION_LOSS", "SING_VALIDATE_FALED_4", "SING_VALIDATE_FALED"} and retry and require_sid:
             self._sid = None
             await self.async_login()
             return await self._request(
