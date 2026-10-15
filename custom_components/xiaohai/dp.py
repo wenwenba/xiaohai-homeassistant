@@ -86,6 +86,20 @@ def _code_dp(schema: dict[str, str], *codes: str, fallback: str | None = None) -
     return fallback
 
 
+def _code_range(schema: dict[str, str], *codes: str) -> list[str] | None:
+    for code in codes:
+        raw = schema.get(f"@range:{code}")
+        if not raw:
+            continue
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(values, list) and values:
+            return [str(value) for value in values]
+    return None
+
+
 def profile(device: dict) -> dict | None:
     """How to control this device. None for gateways and unknown products."""
     category = str(device.get("category") or "")
@@ -107,12 +121,35 @@ def profile(device: dict) -> dict | None:
         "current": current,
         "mode": _code_dp(schema, "mode", fallback=base.get("mode")),
         "fan": _code_dp(schema, "fan_speed_enum", "fan_speed", "speed", fallback=base.get("fan")),
+        "fan_values": _code_range(schema, "fan_speed_enum", "fan_speed", "speed"),
     }
 
 
-def speed_choices(current: Any) -> list[str]:
+def _enum_range(item: dict) -> list[str] | None:
+    raw = item.get("values")
+    if raw is None:
+        raw = item.get("property")
+    if isinstance(raw, str) and raw[:1] in "{[":
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(raw, dict):
+        raw = raw.get("range")
+    if isinstance(raw, list) and raw and all(isinstance(value, str) for value in raw):
+        return [str(value) for value in raw]
+    return None
+
+
+def speed_choices(current: Any, values: list[str] | None = None) -> list[str]:
+    """Fan speeds. A cloud enum list wins; otherwise level_1 means five gears."""
     text = "" if current is None else str(current)
-    choices = ["auto", "level_1", "level_2", "level_3"] if "level_" in text else ["auto", "level1", "level2", "level3"]
+    if values:
+        choices = list(values)
+    elif "level_" in text:
+        choices = ["auto"] + [f"level_{i}" for i in range(1, 6)]
+    else:
+        choices = ["auto", "level1", "level2", "level3"]
     if text and text not in choices:
         choices.append(text)
     return choices
@@ -246,6 +283,9 @@ def schema_from_payload(payload: Any) -> dict[str, dict[str, str]]:
                     dp = item["id"]
                 if code and dp is not None:
                     codes[str(code)] = str(dp)
+                    enum_range = _enum_range(item)
+                    if enum_range:
+                        codes[f"@range:{code}"] = json.dumps(enum_range, ensure_ascii=False)
         if codes:
             found[str(product_id)] = codes
 
@@ -290,6 +330,22 @@ def _self_check() -> None:
         [{"productId": "bb8ial3n", "functionList": [{"code": "temp_set", "id": 2}]}]
     )
     assert schema["bb8ial3n"]["temp_set"] == "2"
+    assert speed_choices("level_1") == ["auto", "level_1", "level_2", "level_3", "level_4", "level_5"]
+    assert speed_choices("level1") == ["auto", "level1", "level2", "level3"]
+    ranged = schema_from_payload(
+        [{
+            "productId": "bb8ial3n",
+            "functionList": [{
+                "code": "fan_speed_enum",
+                "id": 5,
+                "values": "{\"range\":[\"auto\",\"level_1\",\"level_2\",\"level_3\",\"level_4\",\"level_5\"]}",
+            }],
+        }]
+    )
+    assert json.loads(ranged["bb8ial3n"]["@range:fan_speed_enum"])[1] == "level_1"
+    spec = profile({"category": "kt", "_schema": ranged["bb8ial3n"]})
+    assert spec["fan_values"][-1] == "level_5"
+    assert speed_choices("auto", spec["fan_values"]) == spec["fan_values"]
 
 
 if __name__ == "__main__":

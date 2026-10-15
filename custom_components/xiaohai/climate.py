@@ -124,7 +124,7 @@ class XiaohaiClimate(XiaohaiEntity, ClimateEntity):
     def fan_modes(self) -> list[str] | None:
         if not self._spec.get("fan"):
             return None
-        return speed_choices(dp_value(self.device, self._spec.get("fan")))
+        return speed_choices(dp_value(self.device, self._spec.get("fan")), self._spec.get("fan_values"))
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         power = self._spec.get("power")

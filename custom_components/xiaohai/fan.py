@@ -72,7 +72,7 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
     def preset_modes(self) -> list[str] | None:
         if not self._spec.get("fan"):
             return None
-        return speed_choices(dp_value(self.device, self._spec.get("fan")))
+        return speed_choices(dp_value(self.device, self._spec.get("fan")), self._spec.get("fan_values"))
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         fan = self._spec.get("fan")
