@@ -372,11 +372,12 @@ def _frame_body(data: bytes) -> tuple[int, bytes] | None:
     return command, frame[16:-36]
 
 
-def _open_session(sock: socket.socket, key: str) -> bytes | None:
+def _open_session(sock: socket.socket, key: str, *, encrypt: bool = True) -> bytes | None:
     raw_key = key.encode("utf-8")[:16]
     nonce = os.urandom(16)
+    payload = _aes(raw_key, nonce) if encrypt else nonce
     try:
-        sock.sendall(pack_signed(1, 3, _aes(raw_key, nonce), raw_key))
+        sock.sendall(pack_signed(1, 3, payload, raw_key))
         data = _read_frame(sock)
     except OSError:
         return None
@@ -408,24 +409,46 @@ def _open_session(sock: socket.socket, key: str) -> bytes | None:
     return _aes(raw_key, mixed)
 
 
-def _session_matches(ip: str, key: str) -> bool:
+def _session_kind(ip: str, key: str) -> str | None:
+    for encrypt in (True, False):
+        try:
+            sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
+        except OSError:
+            return None
+        try:
+            if _open_session(sock, key, encrypt=encrypt):
+                return "3.4" if encrypt else "3.4p"
+        finally:
+            sock.close()
+    return None
+
+
+def _clue(ip: str, key: str) -> str:
+    raw_key = key.encode("utf-8")[:16]
+    nonce = os.urandom(16)
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
     except OSError:
-        return False
+        return "连不上"
     try:
-        return _open_session(sock, key) is not None
+        sock.sendall(pack_signed(1, 3, _aes(raw_key, nonce), raw_key))
+        sock.settimeout(0.8)
+        try:
+            data = sock.recv(64)
+        except OSError:
+            data = b""
     finally:
         sock.close()
+    return f"会话回{len(data)}字节 {data[:8].hex()}"
 
 
-def _publish_34(ip: str, key: str, cid: str, dps: dict[str, Any]) -> str:
+def _publish_34(ip: str, key: str, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=3)
     except OSError:
         return "连接失败"
     try:
-        session = _open_session(sock, key)
+        session = _open_session(sock, key, encrypt=not plain)
         if not session:
             return "会话失败"
         raw = b"3.4" + (b"\x00" * 12) + json.dumps(
@@ -471,6 +494,13 @@ def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]]
     if not bases:
         return {}, f"本机 {local}，没有可扫描的局域网段"
     keys = _gateway_keys(devices)
+    seen = {dev_id for dev_id, _key in keys}
+    for device in devices.values():
+        dev_id = str(device.get("devId") or "")
+        key = device.get("localKey")
+        if dev_id and dev_id not in seen and isinstance(key, str) and len(key) >= 16:
+            keys.append((dev_id, key[:16]))
+            seen.add(dev_id)
     open_ips: list[str] = []
     own = {local}
     for base in bases:
@@ -481,16 +511,14 @@ def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]]
     found: dict[str, dict[str, str]] = {}
     for ip in open_ips[:8]:
         for dev_id, key in keys:
-            if _session_matches(ip, key):
-                found[dev_id] = {"ip": ip, "version": "3.4", "dev": dev_id}
+            kind = _session_kind(ip, key)
+            if kind:
+                found[dev_id] = {"ip": ip, "version": kind, "dev": dev_id}
                 break
-            if _probe(ip, key):
-                found[dev_id] = {"ip": ip, "version": "3.3", "dev": dev_id}
-                break
+        if found:
+            break
     where = "、".join(open_ips[:4])
-    peek = ""
-    if open_ips and keys and not found:
-        peek = _peek(open_ips[0], keys[0][1])
+    peek = _clue(open_ips[0], keys[0][1]) if open_ips and keys and not found else ""
     note = (
         f"本机 {local}，扫描 {','.join(bases)}，6668 开放 {len(open_ips)}"
         + (f"（{where}）" if where else "")
@@ -572,7 +600,7 @@ def publish_local(
     version = str(found.get("version") or "")
     ip = found.get("ip") or _private_ip(owner.get("ip"))
     if version.startswith("3.4") and ip:
-        return _publish_34(ip, key[:16], cid, dps)
+        return _publish_34(ip, key[:16], cid, dps, plain=version == "3.4p")
     if version.startswith("3.5"):
         return f"网关协议 {version}"
     if not ip:
