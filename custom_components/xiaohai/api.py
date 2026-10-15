@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
-from .dp import rooms_from_payload, schema_from_payload
+from .dp import device_ids, payload_shape, rooms_from_payload, schema_from_payload
 
 
 class XiaohaiError(Exception):
@@ -65,6 +65,8 @@ class XiaohaiClient:
         self._password = password
         self._country_code = country_code.strip() or "86"
         self._sid: str | None = None
+        self.last_room_note = ""
+        self._room_source = ""
 
     @property
     def uses_email(self) -> bool:
@@ -144,27 +146,48 @@ class XiaohaiClient:
             for room in listed or []
             if isinstance(room, dict) and room.get("id") is not None and room.get("name")
         }
-        attempts = (
+        attempts = () if self._room_source == "entity" else (
             ("tuya.m.my.group.device.sort.list", "1.0", {"gid": gid_s}),
+            ("tuya.m.my.group.device.sort.list", "1.0", {"gid": int(gid)}),
             ("tuya.m.my.group.device.relation.list", "2.0", None),
-            ("tuya.m.my.group.device.relation.list", "2.0", {"gid": gid_s}),
+            ("tuya.m.my.group.device.relation.list", "2.0", {"gid": int(gid)}),
             ("tuya.m.location.get", "3.1", {"gid": int(gid)}),
         )
-        last_error: XiaohaiError | None = None
+        notes: list[str] = []
         for action, version, payload in attempts:
             try:
                 result = await self._request(
                     action, payload, extra_params={"gid": gid_s}, version=version
                 )
             except XiaohaiError as err:
-                last_error = err
+                notes.append(f"{action} {version}: {err}")
                 continue
             found = rooms_from_payload(result, names)
             if found:
+                self._room_source = "bulk"
+                self.last_room_note = ""
                 return found
-        if last_error and not names:
-            raise last_error
-        return {}
+            notes.append(f"{action} {version}: {payload_shape(result)}")
+        mapped: dict[str, str] = {}
+        for room_id, room_name in names.items():
+            try:
+                result = await self._request(
+                    "tuya.m.device.relation.entity.list",
+                    {"parentId": str(room_id), "parentType": 4},
+                    extra_params={"gid": gid_s},
+                )
+            except XiaohaiError as err:
+                notes.append(f"entity.list: {err}")
+                break
+            ids = device_ids(result)
+            if ids:
+                mapped.update({dev_id: room_name for dev_id in ids})
+            else:
+                notes.append(f"entity.list {room_name}: {payload_shape(result)}")
+        if mapped:
+            self._room_source = "entity"
+        self.last_room_note = "" if mapped else " | ".join(notes)[:800]
+        return mapped
 
     async def async_product_schema(self, gid: Any) -> dict[str, dict[str, str]]:
         """Map productId to datapoint code -> dp id, when the cloud has a schema."""

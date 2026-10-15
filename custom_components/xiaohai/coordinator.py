@@ -46,11 +46,15 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         for gid in gids:
             try:
                 rooms.update(await self.client.async_device_rooms(gid))
-                self._room_warned = False
             except XiaohaiError as err:
                 if not self._room_warned:
                     _LOGGER.warning("房间关系没有取到：%s", err)
                     self._room_warned = True
+            if rooms:
+                self._room_warned = False
+            elif self.client.last_room_note and not self._room_warned:
+                _LOGGER.warning("房间关系没有解析出来：%s", self.client.last_room_note)
+                self._room_warned = True
             schemas.update(await self.client.async_product_schema(gid))
 
         indexed = {}

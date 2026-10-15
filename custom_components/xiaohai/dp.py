@@ -61,6 +61,8 @@ def celsius(value: Any) -> float | None:
     """Cloud temperatures are plain °C. Values above 60 are decidegrees (260 = 26.0)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
+    if value == 0:
+        return None
     if value > 60:
         return float(value) / 10
     return float(value)
@@ -137,8 +139,10 @@ def rooms_from_payload(payload: Any, names: dict[str, str]) -> dict[str, str]:
 
     def visit(node: dict) -> None:
         dev = node.get("bizId") or node.get("devId")
+        if dev and isinstance(node.get("roomName"), str) and node["roomName"]:
+            found[str(dev)] = node["roomName"]
         room_id = node.get("roomId")
-        if dev and room_id is not None:
+        if dev and room_id not in (None, "", 0, "0"):
             room_name = names.get(str(room_id))
             if room_name:
                 found[str(dev)] = room_name
@@ -155,6 +159,30 @@ def rooms_from_payload(payload: Any, names: dict[str, str]) -> dict[str, str]:
 
     _walk(payload, visit)
     return found
+
+
+def device_ids(payload: Any) -> list[str]:
+    """Device ids inside a room-membership response."""
+    found: list[str] = []
+
+    def visit(node: dict) -> None:
+        for key in ("bizId", "devId"):
+            value = node.get(key)
+            if isinstance(value, str) and len(value) > 8 and value not in found:
+                found.append(value)
+
+    _walk(payload, visit)
+    return found
+
+
+def payload_shape(payload: Any) -> str:
+    """Key names only, so a failed room lookup can be diagnosed without secrets."""
+    if isinstance(payload, list):
+        head = payload_shape(payload[0]) if payload else "-"
+        return f"list {len(payload)} {head}"
+    if isinstance(payload, dict):
+        return ",".join(sorted(payload)[:12])
+    return type(payload).__name__
 
 
 def schema_from_payload(payload: Any) -> dict[str, dict[str, str]]:
@@ -202,6 +230,7 @@ def _self_check() -> None:
     assert device_online({}) is None
     assert celsius(26) == 26
     assert celsius(260) == 26.0
+    assert celsius(0) is None
     assert celsius(False) is None
     ac = profile({"category": "kt", "productId": "bb8ial3n"})
     assert ac["target"] == "2" and ac["current"] == "3" and ac["kind"] == "climate"
@@ -212,6 +241,7 @@ def _self_check() -> None:
         {"45684092": "客厅"},
     )
     assert rooms == {"dev1": "客厅"}
+    assert device_ids([{"bizId": "abcdef123456"}]) == ["abcdef123456"]
     schema = schema_from_payload(
         [{"productId": "bb8ial3n", "functionList": [{"code": "temp_set", "id": 2}]}]
     )
