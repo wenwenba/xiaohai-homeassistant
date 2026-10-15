@@ -28,7 +28,6 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         )
         self.client = client
         self._room_warned = False
-        self._schema_noted = False
         self._device_ids: tuple[str, ...] = ()
 
     async def _async_update_data(self) -> dict[str, dict]:
@@ -59,26 +58,6 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 _LOGGER.warning("房间关系没有解析出来：%s", self.client.last_room_note)
                 self._room_warned = True
             schemas.update(await self.client.async_product_schema(gid))
-        if not self._schema_noted:
-            codes = sorted(
-                {
-                    key
-                    for item in schemas.values()
-                    for key in item
-                    if not str(key).startswith("@")
-                }
-            )
-            has_range = any(str(key).startswith("@range:") for item in schemas.values() for key in item)
-            has_limit = any(str(key).startswith("@limit:") for item in schemas.values() for key in item)
-            _LOGGER.warning(
-                "产品配置：%s 个产品，功能码 %s，枚举范围%s，数值范围%s，字段 %s",
-                len(schemas),
-                codes,
-                "有" if has_range else "没有",
-                "有" if has_limit else "没有",
-                self.client.last_schema_note,
-            )
-            self._schema_noted = True
 
         indexed = {}
         for device in devices:

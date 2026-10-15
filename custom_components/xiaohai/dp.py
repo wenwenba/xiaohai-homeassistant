@@ -205,8 +205,7 @@ def _unique(values: list[str]) -> list[str]:
     return found
 
 
-def _device_tokens(standard: list[str] | None, raw: Any) -> list[str] | None:
-    """Device enum hidden behind a standard-name mapping, when the cloud sent one."""
+def _mapping(raw: Any) -> dict[str, str] | None:
     if isinstance(raw, str):
         text = raw.strip()
         if not text or text[:1] != "{":
@@ -217,17 +216,36 @@ def _device_tokens(standard: list[str] | None, raw: Any) -> list[str] | None:
             return None
     if not isinstance(raw, dict) or not raw:
         return None
-    if not all(isinstance(value, str) for value in raw.values()):
+    if len(raw) == 1:
+        only = next(iter(raw.values()))
+        if isinstance(only, str) and only.strip()[:1] == "{":
+            inner = _mapping(only)
+            if inner:
+                return inner
+    if all(isinstance(value, str) for value in raw.values()):
+        return {str(key): str(value) for key, value in raw.items()}
+    return None
+
+
+def _device_tokens(standard: list[str] | None, raw: Any) -> list[str] | None:
+    """Device enum hidden behind a standard-name mapping, when the cloud sent one."""
+    mapping = _mapping(raw)
+    if not mapping or not standard:
         return None
-    keys = [str(key) for key in raw]
-    values = [str(value) for value in raw.values()]
-    standard_set = set(standard or [])
-    if not standard_set:
-        return None
+    standard_set = set(standard)
+    keys = list(mapping)
+    values = list(mapping.values())
     if set(keys) <= standard_set and any(value not in standard_set for value in values):
-        return _unique(values)
+        grouped = {token: [] for token in standard}
+        for standard_token, device in mapping.items():
+            grouped[standard_token].append(device)
+        return _unique([device for token in standard for device in grouped[token]])
     if set(values) <= standard_set and any(key not in standard_set for key in keys):
-        return _unique(keys)
+        grouped = {token: [] for token in standard}
+        for device, standard_token in mapping.items():
+            if standard_token in grouped:
+                grouped[standard_token].append(device)
+        return _unique([device for token in standard for device in grouped[token]])
     return None
 
 
@@ -376,43 +394,6 @@ def device_ids(payload: Any) -> list[str]:
 
     _walk(payload, visit)
     return found
-
-
-def schema_field_names(payload: Any) -> str:
-    """Fan and mode mapping rules. Tokens only, no account data."""
-    found: list[str] = []
-
-    def visit(node: Any) -> None:
-        if len(found) >= 8 or not isinstance(node, dict):
-            return
-        for key in (
-            "functionSchemaList",
-            "statusSchemaList",
-            "functionList",
-            "statusList",
-            "schema",
-            "functions",
-            "status",
-        ):
-            items = node.get(key)
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if not isinstance(item, dict) or len(found) >= 8:
-                    continue
-                code = str(item.get("standardCode") or item.get("dpCode") or item.get("code") or "")
-                if code not in {"fan_speed_enum", "fan_speed", "speed", "mode"}:
-                    continue
-                rule = item.get("strategyValue")
-                if isinstance(rule, str) and len(rule) > 400:
-                    rule = rule[:400] + "..."
-                found.append(
-                    f"{code} map[{item.get('relationDpIdMaps')}] range[{item.get('valueRange')}] "
-                    f"strategy[{item.get('strategyCode')}] rule[{rule}]"
-                )
-
-    _walk(payload, visit)
-    return " | ".join(found) or payload_shape(payload)
 
 
 def payload_shape(payload: Any) -> str:
@@ -585,13 +566,26 @@ def _self_check() -> None:
         }]
     )
     assert profile({"_schema": mapped["bb8ial3n"]})["fan_values"] == [
+        "auto",
         "level_1",
         "level_2",
         "level_3",
         "level_4",
         "level_5",
-        "auto",
     ]
+    nested = schema_from_payload(
+        [{
+            "productId": "bb8ial3n",
+            "functionSchemaList": [{
+                "standardCode": "fan_speed_enum",
+                "valueRange": "{\"range\":[\"low\",\"middle\",\"high\",\"auto\"]}",
+                "strategyCode": "enum",
+                "strategyValue": "{\"fan_speed_enum\":\"{\\\"high\\\":\\\"level_3\\\",\\\"auto\\\":\\\"auto\\\",\\\"middle\\\":\\\"level_2\\\",\\\"low\\\":\\\"level_1\\\"}\"}",
+                "relationDpIdMaps": {"fan_speed_enum": 5},
+            }],
+        }]
+    )
+    assert profile({"_schema": nested["bb8ial3n"]})["fan_values"] == ["level_1", "level_2", "level_3", "auto"]
     assert live["fan_values"] == ["auto", "level_1", "level_2", "level_3", "level_4", "level_5"]
     assert live["target_min"] == 16 and live["target_max"] == 32 and live["target_step"] == 1
     assert live["target_scale"] == 0 and live["current_scale"] == 0
