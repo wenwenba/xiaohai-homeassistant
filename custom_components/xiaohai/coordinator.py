@@ -13,7 +13,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
 from .dp import device_id_from_unique_id
-from .lan import discover_gateways
+from .lan import discover_gateways, private_gateway_ips
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self.client = client
         self._room_warned = False
         self._device_ids: tuple[str, ...] = ()
-        self._fields_logged = False
+        self._ip_logged = False
         self._lan_at = 0.0
 
     async def _async_update_data(self) -> dict[str, dict]:
@@ -73,9 +73,10 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             _LOGGER.info("已从云端获取 %s 台设备", len(ids))
             self._device_ids = ids
         self.client.devices = indexed
-        if not self._fields_logged and ids:
-            _LOGGER.warning("设备字段：%s", ",".join(sorted(str(key) for key in indexed[ids[0]])))
-            self._fields_logged = True
+        if not self._ip_logged:
+            ips = private_gateway_ips(indexed)
+            _LOGGER.warning("云端给出的网关局域网地址：%s", "、".join(ips) or "无")
+            self._ip_logged = True
         await self._async_discover()
         return indexed
 

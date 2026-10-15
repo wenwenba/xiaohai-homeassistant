@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import binascii
 import json
+import select
 import socket
 import struct
 import time
@@ -132,21 +133,31 @@ def _note(item: dict[str, Any], sender: str) -> dict[str, str] | None:
     return {"ip": ip, "version": str(item.get("version") or "")}
 
 
-def _read_datagram(blob: bytes, sender: str) -> dict[str, str] | None:
-    for item in _json_objects(blob):
-        noted = _note(item, sender)
-        if noted:
-            return noted
-    try:
-        opened = _aes(UDP_KEY, blob, decrypt=True)
-    except Exception:
-        opened = b""
-    for item in _json_objects(opened):
-        noted = _note(item, sender)
-        if noted:
-            return noted
+def _pieces(blob: bytes) -> list[bytes]:
+    found = [blob]
+    def opened(raw: bytes) -> None:
+        if raw and len(raw) % 16 == 0:
+            try:
+                found.append(_aes(UDP_KEY, raw, decrypt=True))
+            except Exception:
+                return
+    opened(blob)
     if blob.startswith(PREFIX) and len(blob) > 24:
-        return _read_datagram(blob[16:-8], sender)
+        inner = blob[16:-8]
+        found.append(inner)
+        opened(inner)
+        if inner.startswith(b"3.3"):
+            opened(inner[15:])
+    return found
+
+
+def _notice(blob: bytes, sender: str) -> tuple[str, dict[str, str]] | None:
+    for piece in _pieces(blob):
+        for item in _json_objects(piece):
+            noted = _note(item, sender)
+            gateway = item.get("gwId") or item.get("devId")
+            if noted and gateway:
+                return str(gateway), noted
     return None
 
 
@@ -161,56 +172,69 @@ def _local_ip() -> str:
         sock.close()
 
 
-def discover_gateways(timeout: float = 2.0) -> dict[str, dict[str, str]]:
-    """Broadcast for gateways and return gwId -> {ip, version}.
-
-    shortcut: one short broadcast. A gateway that does not answer is left for
-    the cloud path.
-    """
-    found: dict[str, dict[str, str]] = {}
+def _bind(port: int) -> socket.socket | None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(0.4)
-        sock.bind(("0.0.0.0", 0))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.bind(("0.0.0.0", port))
+        return sock
+    except OSError:
+        sock.close()
+        return None
+
+
+def discover_gateways(timeout: float = 5.0) -> dict[str, dict[str, str]]:
+    """Listen for gateway broadcasts and return gwId -> {ip, version}.
+
+    shortcut: one five-second listen. A gateway that stays quiet is left for
+    the cloud path.
+    """
+    found: dict[str, dict[str, str]] = {}
+    sockets = [sock for port in (0, 6666, 6667) if (sock := _bind(port))]
+    if not sockets:
+        return found
+    try:
         message = json.dumps({"from": "app", "ip": _local_ip()}).encode()
         encrypted = _aes(UDP_KEY, _pad(message))
         frames = (encrypted, pack(0, 0, encrypted))
         for port in (6666, 6667):
             for frame in frames:
                 try:
-                    sock.sendto(frame, ("255.255.255.255", port))
+                    sockets[0].sendto(frame, ("255.255.255.255", port))
                 except OSError:
                     continue
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            try:
-                blob, sender = sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            gateway = _gateway_id(blob, sender[0])
-            noted = _read_datagram(blob, sender[0])
-            if gateway and noted:
-                found[gateway] = noted
+            ready, _, _ = select.select(sockets, [], [], 0.4)
+            for sock in ready:
+                try:
+                    blob, sender = sock.recvfrom(2048)
+                except OSError:
+                    continue
+                noticed = _notice(blob, sender[0])
+                if noticed:
+                    gateway, noted = noticed
+                    found[gateway] = noted
     finally:
-        sock.close()
+        for sock in sockets:
+            sock.close()
     return found
 
 
-def _gateway_id(blob: bytes, sender: str) -> str | None:
-    blobs = [blob]
-    try:
-        blobs.append(_aes(UDP_KEY, blob, decrypt=True))
-    except Exception:
-        pass
-    if blob.startswith(PREFIX) and len(blob) > 24:
-        blobs.append(blob[16:-8])
-    for item_blob in blobs:
-        for item in _json_objects(item_blob):
-            gateway = item.get("gwId") or item.get("devId")
-            if gateway and (_private_ip(item.get("ip")) or _private_ip(sender)):
-                return str(gateway)
-    return None
+def private_gateway_ips(devices: dict[str, dict[str, Any]]) -> list[str]:
+    """LAN addresses the cloud already attached to a gateway. Public addresses are ignored."""
+    ips: list[str] = []
+    for device in devices.values():
+        kind = device.get("category") or device.get("categoryCode")
+        if kind not in {"jzq", "wg2"}:
+            continue
+        ip = _private_ip(device.get("ip"))
+        if ip and ip not in ips:
+            ips.append(ip)
+    return ips
 
 
 def publish_local(
