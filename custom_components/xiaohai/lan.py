@@ -361,6 +361,33 @@ def _read_frame(sock: socket.socket) -> bytes:
     return data
 
 
+def _remote_nonce(data: bytes, raw_key: bytes, nonce: bytes) -> bytes:
+    if len(data) < 24 or not data.startswith(PREFIX):
+        return b""
+    length = struct.unpack(">I", data[12:16])[0]
+    frame = data[: 16 + length]
+    if len(frame) < 24 or not frame.endswith(SUFFIX):
+        return b""
+    if struct.unpack(">I", frame[8:12])[0] != 4:
+        return b""
+    blobs = [frame[16:-8]]
+    if len(frame) >= 52:
+        blobs.insert(0, frame[16:-36])
+    check = hmac.new(raw_key, nonce, hashlib.sha256).digest()
+    for blob in blobs:
+        chunks = (blob[4:], blob) if len(blob) > 4 else (blob,)
+        for chunk in chunks:
+            if not chunk or len(chunk) % 16:
+                continue
+            try:
+                plain = _unpad(_aes(raw_key, chunk, decrypt=True))
+            except Exception:
+                continue
+            if len(plain) >= 48 and plain[16:48] == check:
+                return plain[:16]
+    return b""
+
+
 def _frame_body(data: bytes) -> tuple[int, bytes] | None:
     if len(data) < 52 or not data.startswith(PREFIX) or not data.endswith(SUFFIX):
         return None
@@ -381,22 +408,7 @@ def _open_session(sock: socket.socket, key: str, *, encrypt: bool = True) -> byt
         data = _read_frame(sock)
     except OSError:
         return None
-    parts = _frame_body(data)
-    if not parts or parts[0] != 4:
-        return None
-    blob = parts[1]
-    remote = b""
-    for chunk in (blob[4:], blob) if len(blob) > 4 else (blob,):
-        if not chunk or len(chunk) % 16:
-            continue
-        try:
-            plain = _unpad(_aes(raw_key, chunk, decrypt=True))
-        except Exception:
-            continue
-        check = hmac.new(raw_key, nonce, hashlib.sha256).digest()
-        if len(plain) >= 48 and plain[16:48] == check:
-            remote = plain[:16]
-            break
+    remote = _remote_nonce(data, raw_key, nonce)
     if not remote:
         return None
     finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
@@ -432,14 +444,15 @@ def _clue(ip: str, key: str) -> str:
         return "连不上"
     try:
         sock.sendall(pack_signed(1, 3, _aes(raw_key, nonce), raw_key))
-        sock.settimeout(0.8)
-        try:
-            data = sock.recv(64)
-        except OSError:
-            data = b""
+        data = _read_frame(sock)
+    except OSError:
+        data = b""
     finally:
         sock.close()
-    return f"会话回{len(data)}字节 {data[:8].hex()}"
+    if len(data) < 16 or not data.startswith(PREFIX):
+        return f"会话回{len(data)}字节 {data[:8].hex()}"
+    command, length = struct.unpack(">II", data[8:16])
+    return f"会话回{len(data)} 命令{command} 长度{length} 尾{data[-4:].hex()}"
 
 
 def _publish_34(ip: str, key: str, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
