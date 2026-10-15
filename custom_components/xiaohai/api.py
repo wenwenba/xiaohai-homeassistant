@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+import uuid
 from typing import Any
 
 import aiohttp
@@ -169,6 +170,7 @@ class XiaohaiClient:
             "v": API_VERSION,
             "time": str(int(time.time())),
             "et": ET_VERSION,
+            "requestId": str(uuid.uuid4()),
         }
         if extra_params:
             form.update(extra_params)
