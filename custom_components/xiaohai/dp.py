@@ -151,12 +151,20 @@ def rooms_from_payload(payload: Any, names: dict[str, str]) -> dict[str, str]:
                 found[str(dev)] = named
         if not isinstance(node.get("name"), str):
             return
-        for key in ("deviceIds", "devIds", "deviceList", "devices"):
+        for key in ("deviceIds", "devIds", "deviceList", "devices", "ids"):
             ids = node.get(key)
+            if isinstance(ids, str) and ids[:1] == "[":
+                try:
+                    ids = json.loads(ids)
+                except json.JSONDecodeError:
+                    continue
             if not isinstance(ids, list):
                 continue
             for item in ids:
                 if isinstance(item, dict):
+                    # 6 is a device. Groups and rooms share this list.
+                    if item.get("type") not in (None, 6, "6"):
+                        continue
                     dev_id = item.get("devId") or item.get("bizId") or item.get("id")
                 else:
                     dev_id = item
@@ -259,6 +267,14 @@ def _self_check() -> None:
         {},
     )
     assert nested == {"dev12345678": "主卧"}
+    detail = rooms_from_payload(
+        {"rooms": [{"name": "客厅", "ids": [
+            {"id": "6c8c9339b6331381ec7a79", "type": 6},
+            {"id": "group12345678", "type": 5},
+        ]}]},
+        {},
+    )
+    assert detail == {"6c8c9339b6331381ec7a79": "客厅"}
     assert device_ids([{"bizId": "abcdef123456"}]) == ["abcdef123456"]
     schema = schema_from_payload(
         [{"productId": "bb8ial3n", "functionList": [{"code": "temp_set", "id": 2}]}]

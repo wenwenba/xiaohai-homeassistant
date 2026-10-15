@@ -134,7 +134,7 @@ class XiaohaiClient:
         return devices
 
     async def async_device_rooms(self, gid: Any) -> dict[str, str]:
-        """Map devId to the cloud room name. The app reads this from sort/relation."""
+        """Map devId to the cloud room name. The app reads rooms[].ids from home.m.detail."""
         gid_s = str(gid)
         listed = await self._request(
             "tuya.m.room.list",
@@ -146,6 +146,33 @@ class XiaohaiClient:
             for room in listed or []
             if isinstance(room, dict) and room.get("id") is not None and room.get("name")
         }
+        found = rooms_from_payload(listed, names)
+        if found:
+            self._room_source = "list"
+            self.last_room_note = ""
+            return found
+        notes: list[str] = []
+        if self._room_source in ("", "detail"):
+            try:
+                detail = await self._request(
+                    "home.m.detail",
+                    {"homeId": gid_s},
+                    extra_params={"gid": gid_s},
+                    version="1.0",
+                )
+            except XiaohaiError as err:
+                notes.append(f"home.m.detail 1.0: {err}")
+            else:
+                found = rooms_from_payload(detail, names)
+                if found:
+                    self._room_source = "detail"
+                    self.last_room_note = ""
+                    return found
+                name_ids = ",".join(f"{key}:{value}" for key, value in list(names.items())[:8])
+                notes.append(f"home.m.detail 1.0: {payload_shape(detail)} names={name_ids}")
+            if self._room_source == "detail":
+                self.last_room_note = " | ".join(notes)[:800]
+                return {}
         attempts = () if self._room_source == "entity" else (
             ("tuya.m.my.group.device.sort.list", "1.0", {"gid": gid_s}),
             ("tuya.m.my.group.device.sort.list", "1.0", {"gid": int(gid)}),
@@ -156,7 +183,6 @@ class XiaohaiClient:
             ("tuya.m.device.relation.entity.list", "1.0", {"parentId": gid_s, "parentType": 2}),
             ("tuya.m.device.relation.list", "3.0", {"parentId": gid_s, "parentType": 2}),
         )
-        notes: list[str] = []
         for action, version, payload in attempts:
             try:
                 result = await self._request(
