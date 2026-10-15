@@ -27,15 +27,9 @@ def _mobile_hash(data: str) -> str:
     return digest[8:16] + digest[0:8] + digest[24:32] + digest[16:24]
 
 
-def _plain_rsa_encrypt(modulus: int, exponent: int, message: bytes) -> bytes:
-    encrypted = pow(int.from_bytes(message, "big"), exponent, modulus)
-    return encrypted.to_bytes(256, "big")
-
-
-def encrypt_password(public_key: str, exponent: str, password: str) -> str:
-    """Encrypt MD5(password) the way the app's email/mobile login does."""
-    password_hash = hashlib.md5(password.encode("utf-8")).hexdigest().encode("utf-8")
-    return _plain_rsa_encrypt(int(public_key), int(exponent), password_hash).hex()
+def password_digest(password: str) -> str:
+    """MD5 of the password, which is what the cloud compares at login."""
+    return hashlib.md5(password.encode("utf-8")).hexdigest()
 
 
 def sign_request(data: dict[str, str], secret: str = SIGN_KEY) -> str:
@@ -95,16 +89,12 @@ class XiaohaiClient:
         login_info = await self._request(
             login_action,
             {
-                account_key: self._username,
                 "countryCode": self._country_code,
-                "ifencrypt": 1,
+                account_key: self._username,
+                "passwd": password_digest(self._password),
                 "options": '{"group": 1}',
-                "passwd": encrypt_password(
-                    str(token_info["publicKey"]),
-                    str(token_info["exponent"]),
-                    self._password,
-                ),
                 "token": token_info["token"],
+                "ifencrypt": 0,
             },
             require_sid=False,
         )
@@ -204,7 +194,12 @@ class XiaohaiClient:
             return await self._request(
                 action, payload, extra_params=extra_params, require_sid=True, retry=False
             )
-        if code in {"USER_PASSWD_WRONG", "USER_NOT_EXISTS", "NOT_EXISTS"} or "passwd" in message.lower():
+        if code in {
+            "USER_PASSWD_WRONG",
+            "USER_NOT_EXISTS",
+            "USER_NAME_NOT_EXIST",
+            "NOT_EXISTS",
+        } or "passwd" in message.lower() or "未注册" in message or "密码" in message:
             raise XiaohaiAuthError(message)
         if code == "1004" or "sign" in message.lower():
             raise XiaohaiError(f"签名被拒绝（{message}）。云端签名与 App 内置算法不一致。")
