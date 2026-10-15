@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import time
 import uuid
 from typing import Any
@@ -13,6 +15,9 @@ import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
 from .dp import payload_shape, rooms_from_payload, schema_from_payload
+from .lan import publish_local
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class XiaohaiError(Exception):
@@ -66,6 +71,9 @@ class XiaohaiClient:
         self._country_code = country_code.strip() or "86"
         self._sid: str | None = None
         self.last_room_note = ""
+        self.devices: dict[str, dict[str, Any]] = {}
+        self.lan: dict[str, dict[str, str]] = {}
+        self._lan_notes: set[str] = set()
 
     @property
     def uses_email(self) -> bool:
@@ -184,6 +192,16 @@ class XiaohaiClient:
         return schema_from_payload(result)
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
+        """Prefer the gateway on the LAN. The cloud publish remains the fallback."""
+        try:
+            result = await asyncio.to_thread(publish_local, self.lan, self.devices, device, dps)
+        except Exception:
+            result = "局域网下发失败"
+        if result == "sent":
+            return {"lan": True}
+        if result not in self._lan_notes:
+            self._lan_notes.add(result)
+            _LOGGER.warning("局域网控制不可用（%s），改走云端", result)
         dev_id = device["devId"]
         gateway_id = device.get("meshId") or device.get("parentId") or dev_id
         return await self._request(
