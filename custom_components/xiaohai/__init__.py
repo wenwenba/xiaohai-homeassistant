@@ -14,6 +14,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import CONF_COUNTRY_CODE, DOMAIN, PLATFORMS
 from .coordinator import XiaohaiCoordinator, async_assign_areas, async_sync_devices
+from .homekit_rename import async_enable_homekit_rename
 
 type XiaohaiConfigEntry = ConfigEntry
 
@@ -47,6 +48,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: XiaohaiConfigEntry) -> b
     entry.async_on_unload(coordinator.async_add_listener(_apply_device_list))
     entry.async_on_unload(coordinator.async_shutdown)
     _remove_legacy_switches(hass, entry.entry_id)
+    await async_enable_homekit_rename(hass)
     if hass.services.has_service("persistent_notification", "dismiss"):
         await hass.services.async_call(
             "persistent_notification",
