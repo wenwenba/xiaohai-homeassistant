@@ -197,6 +197,40 @@ def _number_limit(item: dict) -> dict[str, Any] | None:
     return None
 
 
+def _unique(values: list[str]) -> list[str]:
+    found: list[str] = []
+    for value in values:
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def _device_tokens(standard: list[str] | None, raw: Any) -> list[str] | None:
+    """Device enum hidden behind a standard-name mapping, when the cloud sent one."""
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or text[:1] != "{":
+            return None
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, dict) or not raw:
+        return None
+    if not all(isinstance(value, str) for value in raw.values()):
+        return None
+    keys = [str(key) for key in raw]
+    values = [str(value) for value in raw.values()]
+    standard_set = set(standard or [])
+    if not standard_set:
+        return None
+    if set(keys) <= standard_set and any(value not in standard_set for value in values):
+        return _unique(values)
+    if set(values) <= standard_set and any(key not in standard_set for key in keys):
+        return _unique(keys)
+    return None
+
+
 def _item_codes(item: dict) -> list[str]:
     found: list[str] = []
     for key in ("standardCode", "dpCode", "code", "functionCode"):
@@ -345,11 +379,11 @@ def device_ids(payload: Any) -> list[str]:
 
 
 def schema_field_names(payload: Any) -> str:
-    """Key names of the first cloud schema item. No values."""
+    """Fan and mode mapping rules. Tokens only, no account data."""
     found: list[str] = []
 
     def visit(node: Any) -> None:
-        if len(found) >= 4 or not isinstance(node, dict):
+        if len(found) >= 8 or not isinstance(node, dict):
             return
         for key in (
             "functionSchemaList",
@@ -361,17 +395,21 @@ def schema_field_names(payload: Any) -> str:
             "status",
         ):
             items = node.get(key)
-            if isinstance(items, list) and items and isinstance(items[0], dict):
-                item = items[0]
-                names = ",".join(sorted(str(name) for name in item)[:16])
-                maps = item.get("relationDpIdMaps")
-                strategy = item.get("strategyCode")
-                raw_strategy = item.get("strategyValue")
-                if not isinstance(raw_strategy, str):
-                    raw_strategy = ""
-                elif len(raw_strategy) > 240:
-                    raw_strategy = raw_strategy[:240] + "..."
-                found.append(f"{key}:{names} map[{maps}] strategy[{strategy}] rule[{raw_strategy}]")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or len(found) >= 8:
+                    continue
+                code = str(item.get("standardCode") or item.get("dpCode") or item.get("code") or "")
+                if code not in {"fan_speed_enum", "fan_speed", "speed", "mode"}:
+                    continue
+                rule = item.get("strategyValue")
+                if isinstance(rule, str) and len(rule) > 400:
+                    rule = rule[:400] + "..."
+                found.append(
+                    f"{code} map[{item.get('relationDpIdMaps')}] range[{item.get('valueRange')}] "
+                    f"strategy[{item.get('strategyCode')}] rule[{rule}]"
+                )
 
     _walk(payload, visit)
     return " | ".join(found) or payload_shape(payload)
@@ -422,7 +460,7 @@ def schema_from_payload(payload: Any) -> dict[str, dict[str, str]]:
                 dp = _item_dp(item, names[0] if names else None)
                 if not names or dp is None:
                     continue
-                enum_range = _enum_range(item)
+                enum_range = _device_tokens(_enum_range(item), item.get("strategyValue")) or _enum_range(item)
                 limit = _number_limit(item)
                 for code in names:
                     codes[code] = dp
@@ -535,6 +573,25 @@ def _self_check() -> None:
     flipped_spec = profile({"_schema": flipped["bb8ial3n"]})
     assert flipped_spec["fan"] == "5"
     assert flipped_spec["fan_values"] == ["auto", "low", "middle", "high"]
+    mapped = schema_from_payload(
+        [{
+            "productId": "bb8ial3n",
+            "functionSchemaList": [{
+                "standardCode": "fan_speed_enum",
+                "valueRange": "{\"range\":[\"auto\",\"low\",\"middle\",\"high\"]}",
+                "strategyValue": "{\"level_1\":\"low\",\"level_2\":\"middle\",\"level_3\":\"middle\",\"level_4\":\"high\",\"level_5\":\"high\",\"auto\":\"auto\"}",
+                "relationDpIdMaps": {"fan_speed_enum": 5},
+            }],
+        }]
+    )
+    assert profile({"_schema": mapped["bb8ial3n"]})["fan_values"] == [
+        "level_1",
+        "level_2",
+        "level_3",
+        "level_4",
+        "level_5",
+        "auto",
+    ]
     assert live["fan_values"] == ["auto", "level_1", "level_2", "level_3", "level_4", "level_5"]
     assert live["target_min"] == 16 and live["target_max"] == 32 and live["target_step"] == 1
     assert live["target_scale"] == 0 and live["current_scale"] == 0
