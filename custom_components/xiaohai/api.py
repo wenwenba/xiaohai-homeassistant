@@ -12,6 +12,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
+from .dp import rooms_from_payload, schema_from_payload
 
 
 class XiaohaiError(Exception):
@@ -130,6 +131,53 @@ class XiaohaiClient:
                 devices.append(device)
         return devices
 
+    async def async_device_rooms(self, gid: Any) -> dict[str, str]:
+        """Map devId to the cloud room name. The app reads this from sort/relation."""
+        gid_s = str(gid)
+        listed = await self._request(
+            "tuya.m.room.list",
+            {"gid": int(gid)},
+            extra_params={"gid": gid_s},
+        )
+        names = {
+            str(room.get("id")): room.get("name")
+            for room in listed or []
+            if isinstance(room, dict) and room.get("id") is not None and room.get("name")
+        }
+        attempts = (
+            ("tuya.m.my.group.device.sort.list", "1.0", {"gid": gid_s}),
+            ("tuya.m.my.group.device.relation.list", "2.0", None),
+            ("tuya.m.my.group.device.relation.list", "2.0", {"gid": gid_s}),
+            ("tuya.m.location.get", "3.1", {"gid": int(gid)}),
+        )
+        last_error: XiaohaiError | None = None
+        for action, version, payload in attempts:
+            try:
+                result = await self._request(
+                    action, payload, extra_params={"gid": gid_s}, version=version
+                )
+            except XiaohaiError as err:
+                last_error = err
+                continue
+            found = rooms_from_payload(result, names)
+            if found:
+                return found
+        if last_error and not names:
+            raise last_error
+        return {}
+
+    async def async_product_schema(self, gid: Any) -> dict[str, dict[str, str]]:
+        """Map productId to datapoint code -> dp id, when the cloud has a schema."""
+        try:
+            result = await self._request(
+                "tuya.m.product.standard.config.list",
+                None,
+                extra_params={"gid": str(gid)},
+            )
+        except XiaohaiError:
+            return {}
+        return schema_from_payload(result)
+
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         dev_id = device["devId"]
         gateway_id = device.get("meshId") or device.get("parentId") or dev_id
@@ -150,6 +198,7 @@ class XiaohaiClient:
         extra_params: dict[str, str] | None = None,
         require_sid: bool = True,
         retry: bool = True,
+        version: str | None = None,
     ) -> Any:
         if require_sid and not self._sid:
             await self.async_login()
@@ -157,7 +206,7 @@ class XiaohaiClient:
         form: dict[str, str] = {
             "a": action,
             "clientId": CLIENT_ID,
-            "v": API_VERSION,
+            "v": version or API_VERSION,
             "time": str(int(time.time())),
             "et": ET_VERSION,
             "requestId": str(uuid.uuid4()),
@@ -192,7 +241,12 @@ class XiaohaiClient:
             self._sid = None
             await self.async_login()
             return await self._request(
-                action, payload, extra_params=extra_params, require_sid=True, retry=False
+                action,
+                payload,
+                extra_params=extra_params,
+                require_sid=True,
+                retry=False,
+                version=version,
             )
         if code in {
             "USER_PASSWD_WRONG",

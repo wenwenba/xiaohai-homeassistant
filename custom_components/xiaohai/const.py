@@ -18,5 +18,5 @@ USER_AGENT = "TY-UA=APP/Android/2.1.8/SDK/null"
 CONF_COUNTRY_CODE = "country_code"
 DEFAULT_COUNTRY_CODE = "86"
 
-PLATFORMS = ["switch", "binary_sensor"]
+PLATFORMS = ["climate", "fan", "sensor", "binary_sensor"]
 SCAN_INTERVAL_SECONDS = 30

@@ -6,20 +6,13 @@ from datetime import timedelta
 import logging
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import area_registry as ar, device_registry as dr
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def boolean_dps(device: dict) -> dict[str, bool]:
-    """Return datapoints that can be shown as switches."""
-    dps = device.get("dps") or {}
-    if not isinstance(dps, dict):
-        return {}
-    return {str(key): value for key, value in dps.items() if isinstance(value, bool)}
 
 
 class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
@@ -33,6 +26,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             update_interval=timedelta(seconds=SCAN_INTERVAL_SECONDS),
         )
         self.client = client
+        self._room_warned = False
 
     async def _async_update_data(self) -> dict[str, dict]:
         try:
@@ -41,43 +35,48 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             raise UpdateFailed(f"登录失败：{err}") from err
         except XiaohaiError as err:
             raise UpdateFailed(str(err)) from err
-        indexed = {device["devId"]: device for device in devices}
-        await self._async_debug_snapshot(indexed)
+
+        rooms: dict[str, str] = {}
+        schemas: dict[str, dict] = {}
+        gids: list = []
+        for device in devices:
+            gid = device.get("_group_id")
+            if gid is not None and gid not in gids:
+                gids.append(gid)
+        for gid in gids:
+            try:
+                rooms.update(await self.client.async_device_rooms(gid))
+                self._room_warned = False
+            except XiaohaiError as err:
+                if not self._room_warned:
+                    _LOGGER.warning("房间关系没有取到：%s", err)
+                    self._room_warned = True
+            schemas.update(await self.client.async_product_schema(gid))
+
+        indexed = {}
+        for device in devices:
+            device["_room"] = rooms.get(device["devId"])
+            device["_schema"] = schemas.get(str(device.get("productId") or "")) or {}
+            indexed[device["devId"]] = device
         return indexed
 
-    async def _async_debug_snapshot(self, devices: dict[str, dict]) -> None:
-        """Temporary: one sample per product, plus room-list attempts."""
-        import json
 
-        seen_products: set[str] = set()
-        for device in devices.values():
-            product = str(device.get("productId") or "")
-            if product in seen_products:
-                continue
-            seen_products.add(product)
-            _LOGGER.warning(
-                "xiaohai sample %s %s dpName=%s moduleMap=%s devAttribute=%s virtual=%s topo=%s node=%s",
-                device.get("name"),
-                product,
-                json.dumps(device.get("dpName"), ensure_ascii=False)[:2000],
-                json.dumps(device.get("moduleMap"), ensure_ascii=False)[:800],
-                json.dumps(device.get("devAttribute"), ensure_ascii=False)[:400],
-                device.get("virtual"),
-                device.get("topoType"),
-                device.get("nodeId"),
-            )
-        gid = next(str(device.get("_group_id")) for device in devices.values() if device.get("_group_id"))
-        probes = [
-            ("tuya.m.room.device.list", {"roomId": 45684092, "gid": gid}),
-            ("tuya.m.my.room.device.list", {"roomId": 45684092}),
-            ("tuya.m.device.ref.info.my.list", {"gid": gid}),
-            ("tuya.m.device.relation.list", {"gid": gid}),
-            ("tuya.m.location.list", None),
-        ]
-        for action, payload in probes:
-            try:
-                result = await self.client._request(action, payload, extra_params={"gid": gid})
-            except Exception as err:
-                _LOGGER.warning("xiaohai probe %s %s", action, err)
-            else:
-                _LOGGER.warning("xiaohai probe %s %s", action, json.dumps(result, ensure_ascii=False)[:2500])
+def async_assign_areas(hass: HomeAssistant, devices: dict[str, dict]) -> None:
+    """Put a device in the Home Assistant area that matches its cloud room.
+
+    shortcut: only fills an empty area, so a later manual move is kept.
+    """
+    area_reg = ar.async_get(hass)
+    device_reg = dr.async_get(hass)
+    by_name = {area.name: area.id for area in area_reg.async_list_areas()}
+    for dev_id, device in devices.items():
+        room = device.get("_room")
+        if not room:
+            continue
+        area_id = by_name.get(room)
+        if area_id is None:
+            area_id = area_reg.async_create(room).id
+            by_name[room] = area_id
+        current = device_reg.async_get_device(identifiers={(DOMAIN, dev_id)})
+        if current is not None and current.area_id is None:
+            device_reg.async_update_device(current.id, area_id=area_id)
