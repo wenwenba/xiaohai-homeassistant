@@ -9,11 +9,14 @@ CONTROL_NEW (13). A protocol the gateway does not speak is left to the cloud.
 from __future__ import annotations
 
 import binascii
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import select
 import socket
 import struct
 import time
+import urllib.request
 from typing import Any
 
 PREFIX = b"\x00\x00\x55\xaa"
@@ -186,42 +189,235 @@ def _bind(port: int) -> socket.socket | None:
         return None
 
 
-def discover_gateways(timeout: float = 5.0) -> dict[str, dict[str, str]]:
-    """Listen for gateway broadcasts and return gwId -> {ip, version}.
+def _hosts(base: str) -> list[str]:
+    return [f"{base}.{index}" for index in range(1, 255)]
 
-    shortcut: one five-second listen. A gateway that stays quiet is left for
-    the cloud path.
+
+def _add_base(bases: list[str], ip: str) -> None:
+    if not _private_ip(ip):
+        return
+    base = ".".join(ip.split(".")[:3])
+    if base not in bases:
+        bases.append(base)
+
+
+def _supervisor_ips() -> list[str]:
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        return []
+    request = urllib.request.Request(
+        "http://supervisor/network/info",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8", "ignore"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+    ips: list[str] = []
+    for iface in data.get("interfaces") or []:
+        if not isinstance(iface, dict):
+            continue
+        addresses = (iface.get("ipv4") or {}).get("address") or []
+        for address in addresses:
+            ips.append(str(address).split("/")[0])
+    return ips
+
+
+def _route_ips() -> list[str]:
+    try:
+        rows = open("/proc/net/route", encoding="utf-8").read().splitlines()[1:]
+    except OSError:
+        return []
+    ips: list[str] = []
+    for row in rows:
+        parts = row.split()
+        if len(parts) < 8:
+            continue
+        try:
+            dest, mask = int(parts[1], 16), int(parts[7], 16)
+        except ValueError:
+            continue
+        if bin(mask).count("1") < 24:
+            continue
+        ips.append(socket.inet_ntoa(struct.pack("<I", dest)))
+    return ips
+
+
+def _networks() -> tuple[str, list[str]]:
+    local = _local_ip()
+    bases: list[str] = []
+    for ip in _supervisor_ips():
+        _add_base(bases, ip)
+    _add_base(bases, local)
+    for ip in _route_ips():
+        _add_base(bases, ip)
+    bases.sort(key=lambda base: base.startswith("172."))
+    return local, bases[:3]
+
+
+def _port_open(ip: str) -> str | None:
+    sock = socket.socket()
+    sock.settimeout(0.35)
+    try:
+        sock.connect((ip, TCP_PORT))
+    except OSError:
+        return None
+    else:
+        return ip
+    finally:
+        sock.close()
+
+
+def _gateway_keys(devices: dict[str, dict[str, Any]]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for device in devices.values():
+        kind = device.get("category") or device.get("categoryCode")
+        key = device.get("localKey")
+        dev_id = str(device.get("devId") or "")
+        if kind in {"jzq", "wg2"} and dev_id and isinstance(key, str) and len(key) >= 16:
+            pairs.append((dev_id, key[:16]))
+    return pairs
+
+
+def _accepts(data: bytes, key: str) -> bool:
+    if len(data) < 16 or not data.startswith(PREFIX):
+        return False
+    length = struct.unpack(">I", data[12:16])[0]
+    frame = data[: 16 + length]
+    if len(frame) < 24 or not frame.endswith(SUFFIX):
+        return False
+    payload = frame[16:-8]
+    if payload.startswith(b"3.3"):
+        payload = payload[15:]
+    if not payload or len(payload) % 16:
+        return False
+    try:
+        plain = _unpad(_aes(key.encode("utf-8"), payload, decrypt=True))
+    except Exception:
+        return False
+    if not plain:
+        return False
+    try:
+        json.loads(plain)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return True
+
+
+def _probe(ip: str, key: str) -> bool:
+    frame = pack_33(2, 9, {"t": int(time.time())}, key)
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
+    except OSError:
+        return False
+    try:
+        sock.sendall(frame)
+        sock.settimeout(0.8)
+        try:
+            data = sock.recv(1024)
+        except OSError:
+            return False
+    finally:
+        sock.close()
+    return _accepts(data, key)
+
+
+def _peek(ip: str, key: str) -> str:
+    frame = pack_33(2, 9, {"t": int(time.time())}, key)
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
+    except OSError:
+        return "连不上"
+    try:
+        sock.sendall(frame)
+        sock.settimeout(0.8)
+        try:
+            data = sock.recv(256)
+        except OSError:
+            return "无回应"
+    finally:
+        sock.close()
+    if len(data) < 16 or not data.startswith(PREFIX):
+        return f"非涂鸦{len(data)}字节"
+    command = struct.unpack(">I", data[8:12])[0]
+    return f"命令{command} {data[16:19].hex()}"
+
+
+def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]], str]:
+    """Find gateways by who answers on TCP 6668 with a key from the cloud list.
+
+    shortcut: only the /24s this host can see, and only gateway products.
+    A device that does not speak protocol 3.3 stays on the cloud.
     """
+    local, bases = _networks()
+    if not bases:
+        return {}, f"本机 {local}，没有可扫描的局域网段"
+    keys = _gateway_keys(devices)
+    open_ips: list[str] = []
+    own = {local}
+    for base in bases:
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            for ip in pool.map(_port_open, _hosts(base)):
+                if ip and ip not in own and ip not in open_ips:
+                    open_ips.append(ip)
+    found: dict[str, dict[str, str]] = {}
+    for ip in open_ips[:8]:
+        for dev_id, key in keys:
+            if dev_id in found:
+                continue
+            if _probe(ip, key):
+                found[dev_id] = {"ip": ip, "version": "3.3"}
+                break
+    peek = _peek(open_ips[0], keys[0][1]) if open_ips and keys and not found else ""
+    note = (
+        f"本机 {local}，扫描 {','.join(bases)}，6668 开放 {len(open_ips)}"
+        + (f"，{peek}" if peek else "")
+    )
+    return found, note
+
+
+def discover_gateways(
+    devices: dict[str, dict[str, Any]] | None = None,
+    timeout: float = 1.5,
+) -> tuple[dict[str, dict[str, str]], str]:
+    """Listen briefly, then scan the local subnet for the gateway."""
     found: dict[str, dict[str, str]] = {}
     sockets = [sock for port in (0, 6666, 6667) if (sock := _bind(port))]
-    if not sockets:
-        return found
-    try:
-        message = json.dumps({"from": "app", "ip": _local_ip()}).encode()
-        encrypted = _aes(UDP_KEY, _pad(message))
-        frames = (encrypted, pack(0, 0, encrypted))
-        for port in (6666, 6667):
-            for frame in frames:
-                try:
-                    sockets[0].sendto(frame, ("255.255.255.255", port))
-                except OSError:
-                    continue
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select(sockets, [], [], 0.4)
-            for sock in ready:
-                try:
-                    blob, sender = sock.recvfrom(2048)
-                except OSError:
-                    continue
-                noticed = _notice(blob, sender[0])
-                if noticed:
-                    gateway, noted = noticed
-                    found[gateway] = noted
-    finally:
-        for sock in sockets:
-            sock.close()
-    return found
+    if sockets:
+        try:
+            message = json.dumps({"from": "app", "ip": _local_ip()}).encode()
+            encrypted = _aes(UDP_KEY, _pad(message))
+            frames = (encrypted, pack(0, 0, encrypted))
+            for port in (6666, 6667):
+                for frame in frames:
+                    try:
+                        sockets[0].sendto(frame, ("255.255.255.255", port))
+                    except OSError:
+                        continue
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not found:
+                ready, _, _ = select.select(sockets, [], [], 0.4)
+                for sock in ready:
+                    try:
+                        blob, sender = sock.recvfrom(2048)
+                    except OSError:
+                        continue
+                    noticed = _notice(blob, sender[0])
+                    if noticed:
+                        gateway, noted = noticed
+                        found[gateway] = noted
+        finally:
+            for sock in sockets:
+                sock.close()
+    if found or not devices:
+        return found, ""
+    scanned, note = _scan(devices)
+    found.update(scanned)
+    return found, note
 
 
 def private_gateway_ips(devices: dict[str, dict[str, Any]]) -> list[str]:
@@ -295,6 +491,10 @@ def _self_check() -> None:
     assert unpack_33(frame, key) == body
     assert _private_ip("171.218.238.58") is None
     assert _private_ip("192.168.50.8") == "192.168.50.8"
+    hosts = _hosts("192.168.50")
+    assert len(hosts) == 254 and "192.168.50.0" not in hosts and "192.168.50.255" not in hosts
+    assert _accepts(pack_33(2, 9, {"t": 1}, "0123456789abcdef"), "0123456789abcdef")
+    assert not _accepts(pack_33(2, 9, {"t": 1}, "0123456789abcdef"), "abcdef0123456789")
     print("lan self-check ok")
 
 

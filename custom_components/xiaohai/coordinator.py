@@ -83,12 +83,15 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
     async def _async_discover(self) -> None:
         """Look for the gateway on the LAN. Repeat until one answers, then hourly."""
         now = time.monotonic()
-        if self.client.lan and now - self._lan_at < 3600:
+        wait = 3600 if self.client.lan else 600
+        if self._lan_at and now - self._lan_at < wait:
             return
         try:
-            found = await self.hass.async_add_executor_job(discover_gateways)
+            found, note = await self.hass.async_add_executor_job(
+                discover_gateways, self.client.devices
+            )
         except OSError as err:
-            _LOGGER.info("局域网发现失败：%s", err)
+            _LOGGER.warning("局域网发现失败：%s", err)
             return
         changed = found != self.client.lan or self._lan_at == 0.0
         self._lan_at = now
@@ -97,7 +100,8 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             summary = ", ".join(
                 f"{item['ip']} {item.get('version') or ''}".strip() for item in found.values()
             )
-            _LOGGER.warning("局域网发现 %s 台网关%s", len(found), f"：{summary}" if summary else "")
+            extra = f"：{summary}" if summary else ""
+            _LOGGER.warning("局域网发现 %s 台网关%s%s", len(found), extra, f" {note}" if note else "")
 
 
 def async_assign_areas(hass: HomeAssistant, devices: dict[str, dict]) -> None:
