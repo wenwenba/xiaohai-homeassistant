@@ -107,7 +107,7 @@ def async_sync_devices(hass: HomeAssistant, entry_id: str, devices: dict[str, di
     for device in list(dr.async_entries_for_config_entry(dev_reg, entry_id)):
         idents = [item[1] for item in device.identifiers if item[0] == DOMAIN]
         if not idents or any(item not in live for item in idents):
-            dev_reg.async_update_device(device.id, remove_config_entry_id=entry_id)
+            dev_reg.async_remove_device(device.id)
             continue
         cloud = devices.get(idents[0])
         if cloud is None or device.name_by_user:
