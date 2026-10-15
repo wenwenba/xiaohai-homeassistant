@@ -782,59 +782,60 @@ def _crc_ok(data: bytes, key: bytes) -> bool:
     return plain.startswith(b"{") and b"unvalid" not in plain and b"error" not in plain.lower()
 
 
+def _swap_frames(raw_key: bytes, nonce: bytes, remote: bytes, plain: bytes) -> tuple[bytes, bytes]:
+    """Command 5 is the 32-byte HMAC of the gateway nonce, then control uses the swapped key."""
+    finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
+    mixed = bytes(left ^ right for left, right in zip(nonce, remote))
+    session = _aes(raw_key, mixed)
+    blob = pack_signed(2, 5, _aes(raw_key, finish), raw_key)
+    blob += pack_signed(3, CONTROL_NEW, _aes(session, _pad(plain)), session)
+    return blob, session
+
+
+def _frame_command(data: bytes) -> int:
+    if len(data) < 12 or not data.startswith(PREFIX):
+        return -1
+    return struct.unpack(">I", data[8:12])[0]
+
+
 def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
-    """Handshake and control share one connection. A fresh control write is ignored."""
+    """Finish the key swap, then send control on that same connection."""
     now = int(time.time())
-    wrapped = b"3.4" + (b"\x00" * 12) + json.dumps(
-        control_34(cid, dps, now),
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode()
-    if plain:
-        wrapped = json.dumps(control_body(cid, dps, now), separators=(",", ":"), ensure_ascii=False).encode()
+    body = control_body(cid, dps, now) if plain else control_34(cid, dps, now)
+    wrapped = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+    if not plain:
+        wrapped = b"3.4" + (b"\x00" * 12) + wrapped
+    nonce = os.urandom(16)
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=3)
     except OSError:
         return "连接失败"
-    notes: list[str] = []
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        opened = _open_session(sock, raw_key, encrypt=not plain)
-        if not opened:
+        sock.sendall(pack_signed(1, 3, _aes(raw_key, nonce), raw_key))
+        remote = _signed_nonce(_read_frame(sock), raw_key)
+        if len(remote) != 16:
             return "会话失败"
-        session, _remote = opened
-        frames = [
-            pack_signed(2, CONTROL_NEW, _aes(raw_key, _pad(wrapped)), raw_key),
-            pack_signed(3, CONTROL_NEW, _aes(session, _pad(wrapped)), session),
-        ]
-        for frame in frames:
-            try:
-                sock.sendall(frame)
-                data = _read_frame(sock, 2.5)
-            except OSError:
-                notes.append("断开")
-                break
-            notes.append(_shape(data, raw_key))
-            if _accepted(data, raw_key) or _accepted(data, session) or _crc_ok(data, raw_key):
-                return "sent"
+        blob, session = _swap_frames(raw_key, nonce, remote, wrapped)
+        sock.sendall(blob)
+        first = _read_frame(sock, 2.5)
+        try:
+            second = _read_frame(sock, 1.2)
+        except OSError:
+            second = b""
+    except OSError:
+        return "连接失败"
     finally:
         sock.close()
-    try:
-        sock = socket.create_connection((ip, TCP_PORT), timeout=3)
-    except OSError:
-        return "网关未确认 " + " ".join(notes)
-    try:
-        sock.sendall(pack_33(4, CONTROL_NEW, control_body(cid, dps, now), raw_key.decode("latin-1")))
-        data = _read_frame(sock, 2.5)
-    except OSError:
-        notes.append("CRC断开")
-    else:
-        notes.append("CRC" + _shape(data, raw_key))
-        if _crc_ok(data, raw_key) or _accepted(data, raw_key):
-            return "sent"
-    finally:
-        sock.close()
-    return "网关未确认 " + " ".join(notes)
+
+    def accepted(data: bytes) -> bool:
+        if _frame_command(data) in {3, 5}:
+            return False
+        return _accepted(data, raw_key) or _accepted(data, session) or _crc_ok(data, raw_key)
+
+    if accepted(first) or accepted(second):
+        return "sent"
+    return "网关未确认 " + _shape(first, raw_key) + " " + _shape(second, session)
 
 
 def _peek(ip: str, key: str) -> str:
@@ -1067,6 +1068,12 @@ def _self_check() -> None:
     assert _signed_nonce(reply, b"abcdef0123456789") == b""
     command = _local_command(sample, b"hello")
     assert struct.unpack(">I", command[8:12])[0] == CONTROL_NEW
+    swapped, session = _swap_frames(sample, sample, sample, b"3.4" + (b"\x00" * 12) + b"{}")
+    assert struct.unpack(">I", swapped[8:12])[0] == 5
+    assert len(_aes(sample, hmac.new(sample, sample, hashlib.sha256).digest())) == 32
+    assert len(session) == 16
+    second = swapped.find(PREFIX, 4)
+    assert struct.unpack(">I", swapped[second + 8 : second + 12])[0] == CONTROL_NEW
     ok = PREFIX + struct.pack(">IIII", 1, CONTROL_NEW, 4 + 16 + 36, 0) + (b"\x11" * 16)
     ok += hmac.new(sample, ok, hashlib.sha256).digest() + SUFFIX
     bad = PREFIX + struct.pack(">IIII", 1, CONTROL_NEW, 4 + 16 + 36, 1) + (b"\x11" * 16)
