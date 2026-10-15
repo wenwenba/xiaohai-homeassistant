@@ -8,6 +8,7 @@ CONTROL_NEW (13). A protocol the gateway does not speak is left to the cloud.
 
 from __future__ import annotations
 
+import base64
 import binascii
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -96,7 +97,7 @@ def pack(seq: int, command: int, payload: bytes) -> bytes:
 
 def pack_33(seq: int, command: int, body: dict[str, Any], key: str) -> bytes:
     raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
-    payload = b"3.3" + (b"\x00" * 12) + _aes(key.encode("utf-8"), _pad(raw))
+    payload = b"3.3" + (b"\x00" * 12) + _aes(key.encode("latin-1"), _pad(raw))
     return pack(seq, command, payload)
 
 
@@ -385,8 +386,13 @@ def _remote_nonce(data: bytes, raw_key: bytes, nonce: bytes) -> bytes:
             except Exception:
                 continue
         for plain in plains:
-            if len(plain) >= 48 and plain[16:48] == check:
+            if len(plain) < 48:
+                continue
+            signed = hmac.new(raw_key, plain[:16], hashlib.sha256).digest()
+            if plain[16:48] in {check, signed}:
                 return plain[:16]
+            if plain[:32] == check:
+                return plain[32:48]
     return b""
 
 
@@ -401,8 +407,7 @@ def _frame_body(data: bytes) -> tuple[int, bytes] | None:
     return command, frame[16:-36]
 
 
-def _open_session(sock: socket.socket, key: str, *, encrypt: bool = True) -> bytes | None:
-    raw_key = key.encode("utf-8")[:16]
+def _open_session(sock: socket.socket, raw_key: bytes, *, encrypt: bool = True) -> bytes | None:
     nonce = os.urandom(16)
     payload = _aes(raw_key, nonce) if encrypt else nonce
     try:
@@ -423,22 +428,52 @@ def _open_session(sock: socket.socket, key: str, *, encrypt: bool = True) -> byt
     return _aes(raw_key, mixed)
 
 
-def _session_kind(ip: str, key: str) -> str | None:
+def _session_kind(ip: str, raw_key: bytes) -> str | None:
     for encrypt in (True, False):
         try:
             sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
         except OSError:
-            return None
+            return "down"
         try:
-            if _open_session(sock, key, encrypt=encrypt):
+            if _open_session(sock, raw_key, encrypt=encrypt):
                 return "3.4" if encrypt else "3.4p"
         finally:
             sock.close()
     return None
 
 
-def _clue(ip: str, key: str) -> str:
-    raw_key = key.encode("utf-8")[:16]
+def _key_materials(value: Any, label: str) -> list[tuple[str, bytes]]:
+    if not isinstance(value, str) or len(value) < 16:
+        return []
+    raw = value.encode("utf-8")[:16]
+    found = [(label, raw)]
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        decoded = b""
+    if len(decoded) >= 16 and decoded[:16] != raw:
+        found.append((f"{label}.b64", decoded[:16]))
+    return found
+
+
+def _materials(devices: dict[str, dict[str, Any]]) -> list[tuple[str, str, bytes]]:
+    """Gateway keys first, then every other device. devKey is separate from localKey."""
+    ranked: list[tuple[int, str, str, bytes]] = []
+    for device in devices.values():
+        kind = device.get("category") or device.get("categoryCode")
+        rank = 0 if kind in {"jzq", "wg2"} else 1
+        dev_id = str(device.get("devId") or "")
+        if not dev_id:
+            continue
+        fields = ("localKey", "devKey") if rank == 0 else ("localKey",)
+        for field in fields:
+            for label, raw in _key_materials(device.get(field), field):
+                ranked.append((rank, dev_id, label, raw))
+    ranked.sort(key=lambda item: item[0])
+    return [(dev_id, label, raw) for _rank, dev_id, label, raw in ranked]
+
+
+def _clue(ip: str, raw_key: bytes) -> str:
     nonce = os.urandom(16)
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
@@ -454,16 +489,30 @@ def _clue(ip: str, key: str) -> str:
     if len(data) < 16 or not data.startswith(PREFIX):
         return f"会话回{len(data)}字节 {data[:8].hex()}"
     command, length = struct.unpack(">II", data[8:16])
-    return f"会话回{len(data)} 命令{command} 长度{length} 尾{data[-4:].hex()}"
+    frame = data[: 16 + length]
+    kind = "不能解密"
+    body = frame[16:-8] if frame.endswith(SUFFIX) else b""
+    if body and len(body) % 16 == 0:
+        try:
+            plain = _unpad(_aes(raw_key, body, decrypt=True))
+        except Exception:
+            plain = b""
+        if plain.startswith((b"{", b"[")):
+            kind = "解密为json"
+        elif plain and all(32 <= byte < 127 for byte in plain[:8]):
+            kind = "解密为文本"
+        elif plain:
+            kind = "解密为二进制"
+    return f"会话回{len(data)} 命令{command} 长度{length} 尾{data[-4:].hex()} {kind}"
 
 
-def _publish_34(ip: str, key: str, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
+def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=3)
     except OSError:
         return "连接失败"
     try:
-        session = _open_session(sock, key, encrypt=not plain)
+        session = _open_session(sock, raw_key, encrypt=not plain)
         if not session:
             return "会话失败"
         raw = b"3.4" + (b"\x00" * 12) + json.dumps(
@@ -508,14 +557,7 @@ def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]]
     local, bases = _networks()
     if not bases:
         return {}, f"本机 {local}，没有可扫描的局域网段"
-    keys = _gateway_keys(devices)
-    seen = {dev_id for dev_id, _key in keys}
-    for device in devices.values():
-        dev_id = str(device.get("devId") or "")
-        key = device.get("localKey")
-        if dev_id and dev_id not in seen and isinstance(key, str) and len(key) >= 16:
-            keys.append((dev_id, key[:16]))
-            seen.add(dev_id)
+    materials = _materials(devices)
     open_ips: list[str] = []
     own = {local}
     for base in bases:
@@ -525,18 +567,22 @@ def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]]
                     open_ips.append(ip)
     found: dict[str, dict[str, str]] = {}
     for ip in open_ips[:8]:
-        for dev_id, key in keys:
-            kind = _session_kind(ip, key)
+        for dev_id, label, raw in materials:
+            kind = _session_kind(ip, raw)
+            if kind == "down":
+                break
             if kind:
-                found[dev_id] = {"ip": ip, "version": kind, "dev": dev_id}
+                found[dev_id] = {"ip": ip, "version": kind, "dev": dev_id, "material": label}
                 break
         if found:
             break
     where = "、".join(open_ips[:4])
-    peek = _clue(open_ips[0], keys[0][1]) if open_ips and keys and not found else ""
+    forms = ",".join(dict.fromkeys(label for _dev, label, _raw in materials))
+    peek = _clue(open_ips[0], materials[0][2]) if open_ips and materials and not found else ""
     note = (
         f"本机 {local}，扫描 {','.join(bases)}，6668 开放 {len(open_ips)}"
         + (f"（{where}）" if where else "")
+        + (f"，密钥 {forms}" if forms else "")
         + (f"，{peek}" if peek else "")
     )
     return found, note
@@ -609,18 +655,23 @@ def publish_local(
     if not found and len(lan) == 1:
         found = next(iter(lan.values()))
     owner = devices.get(str(found.get("dev") or "")) or devices.get(gateway_id) or device
-    key = owner.get("localKey")
-    if not isinstance(key, str) or len(key) < 16:
+    label = str(found.get("material") or "localKey")
+    picked = _key_materials(owner.get(label.split(".")[0]), label.split(".")[0])
+    raw_key = next((item for name, item in picked if name == label), b"")
+    if not raw_key:
+        value = owner.get("localKey")
+        raw_key = value.encode("utf-8")[:16] if isinstance(value, str) and len(value) >= 16 else b""
+    if not raw_key:
         return "没有本地密钥"
     version = str(found.get("version") or "")
     ip = found.get("ip") or _private_ip(owner.get("ip"))
     if version.startswith("3.4") and ip:
-        return _publish_34(ip, key[:16], cid, dps, plain=version == "3.4p")
+        return _publish_34(ip, raw_key, cid, dps, plain=version == "3.4p")
     if version.startswith("3.5"):
         return f"网关协议 {version}"
     if not ip:
         return "没有发现网关"
-    frame = pack_33(1, CONTROL_NEW, control_body(cid, dps, int(time.time())), key[:16])
+    frame = pack_33(1, CONTROL_NEW, control_body(cid, dps, int(time.time())), raw_key.decode("latin-1"))
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=3)
     except OSError:
@@ -664,6 +715,10 @@ def _self_check() -> None:
     signed = pack_signed(1, 3, b"\x11" * 16, b"0123456789abcdef")
     assert signed.endswith(SUFFIX) and struct.unpack(">I", signed[12:16])[0] == 52
     assert control_34("abcd", {"1": True}, 1)["data"]["cid"] == "abcd"
+    coded = base64.b64encode(b"0123456789abcdef").decode()
+    forms = _key_materials(coded, "localKey")
+    assert forms[0][0] == "localKey" and ("localKey.b64", b"0123456789abcdef") in forms
+    assert _materials({"g": {"devId": "g", "category": "jzq", "localKey": "0123456789abcdef", "devKey": "abcdef0123456789"}})[1][1] == "devKey"
     print("lan self-check ok")
 
 
