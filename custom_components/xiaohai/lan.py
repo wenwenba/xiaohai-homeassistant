@@ -24,6 +24,8 @@ from typing import Any
 
 PREFIX = b"\x00\x00\x55\xaa"
 SUFFIX = b"\x00\x00\xaa\x55"
+PREFIX35 = b"\x00\x00\x66\x99"
+SUFFIX35 = b"\x00\x00\x99\x66"
 UDP_KEY = b"yGAdlopoPVldABfn"
 CONTROL_NEW = 13
 TCP_PORT = 6668
@@ -87,6 +89,29 @@ def _aes(key: bytes, data: bytes, *, decrypt: bool = False) -> bytes:
     cipher = Cipher(algorithms.AES(key[:16]), modes.ECB())
     ctx = cipher.decryptor() if decrypt else cipher.encryptor()
     return ctx.update(data) + ctx.finalize()
+
+
+def _cbc(key: bytes, iv: bytes, data: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    cipher = Cipher(algorithms.AES(key[:16]), modes.CBC(iv[:16]))
+    ctx = cipher.decryptor()
+    return ctx.update(data) + ctx.finalize()
+
+
+def _key_alts(raw_key: bytes) -> list[bytes]:
+    """The library both uses the local key directly and runs it through MD5."""
+    digest = hashlib.md5(raw_key).digest()
+    if digest == raw_key:
+        return [raw_key]
+    return [raw_key, digest]
+
+
+def _padded(data: bytes) -> bool:
+    if not data:
+        return False
+    extra = data[-1]
+    return 1 <= extra <= 16 and data.endswith(bytes([extra]) * extra)
 
 
 def pack(seq: int, command: int, payload: bytes) -> bytes:
@@ -343,6 +368,61 @@ def control_34(cid: str, dps: dict[str, Any], now: int) -> dict[str, Any]:
     return {"protocol": 5, "t": now, "data": data}
 
 
+def _gcm(key: bytes, iv: bytes, data: bytes, aad: bytes, *, decrypt: bool = False) -> bytes:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    box = AESGCM(key[:16])
+    if decrypt:
+        return box.decrypt(iv, data, aad)
+    return box.encrypt(iv, data, aad)
+
+
+def pack_35(seq: int, command: int, payload: bytes, key: bytes, iv: bytes | None = None) -> bytes:
+    """Protocol 3.5: prefix 6699, 14-byte header as GCM additional data, 12-byte nonce."""
+    iv = iv if iv is not None else os.urandom(12)
+    length = len(payload) + 28
+    aad = b"\x00\x00" + struct.pack(">III", seq, command, length)
+    return PREFIX35 + aad + iv + _gcm(key, iv, payload, aad) + SUFFIX35
+
+
+def unpack_35(data: bytes, key: bytes) -> tuple[int, bytes] | None:
+    if len(data) < 50 or not data.startswith(PREFIX35):
+        return None
+    _seq, command, length = struct.unpack(">III", data[6:18])
+    total = 18 + length + 4
+    if length < 28 or len(data) < total or data[total - 4 : total] != SUFFIX35:
+        return None
+    iv = data[18:30]
+    sealed = data[30 : 18 + length]
+    try:
+        plain = _gcm(key, iv, sealed, data[4:18], decrypt=True)
+    except Exception:
+        return None
+    return command, plain
+
+
+def _read_any(sock: socket.socket) -> bytes:
+    sock.settimeout(1.2)
+    data = b""
+    while len(data) < 18:
+        chunk = sock.recv(1024)
+        if not chunk:
+            return data
+        data += chunk
+    if data.startswith(PREFIX35) and len(data) >= 18:
+        total = 18 + struct.unpack(">I", data[14:18])[0] + 4
+    elif data.startswith(PREFIX) and len(data) >= 16:
+        total = 16 + struct.unpack(">I", data[12:16])[0]
+    else:
+        return data
+    while len(data) < total:
+        chunk = sock.recv(1024)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
 def _read_frame(sock: socket.socket) -> bytes:
     sock.settimeout(1.2)
     data = b""
@@ -362,38 +442,44 @@ def _read_frame(sock: socket.socket) -> bytes:
     return data
 
 
-def _remote_nonce(data: bytes, raw_key: bytes, nonce: bytes) -> bytes:
+def _remote_nonce(data: bytes, raw_key: bytes, nonce: bytes) -> tuple[bytes, bytes] | None:
     if len(data) < 24 or not data.startswith(PREFIX):
-        return b""
+        return None
     length = struct.unpack(">I", data[12:16])[0]
     frame = data[: 16 + length]
     if len(frame) < 24 or not frame.endswith(SUFFIX):
-        return b""
+        return None
     if struct.unpack(">I", frame[8:12])[0] not in {3, 4}:
-        return b""
+        return None
     blobs = [frame[16:-8]]
     if len(frame) >= 52:
         blobs.insert(0, frame[16:-36])
-    check = hmac.new(raw_key, nonce, hashlib.sha256).digest()
-    for blob in blobs:
-        plains = [blob] if len(blob) >= 48 else []
-        chunks = (blob[4:], blob) if len(blob) > 4 else (blob,)
-        for chunk in chunks:
-            if not chunk or len(chunk) % 16:
-                continue
-            try:
-                plains.append(_unpad(_aes(raw_key, chunk, decrypt=True)))
-            except Exception:
-                continue
-        for plain in plains:
-            if len(plain) < 48:
-                continue
-            signed = hmac.new(raw_key, plain[:16], hashlib.sha256).digest()
-            if plain[16:48] in {check, signed}:
-                return plain[:16]
-            if plain[:32] == check:
-                return plain[32:48]
-    return b""
+    for aes_key in _key_alts(raw_key):
+        checks = [hmac.new(mac_key, nonce, hashlib.sha256).digest() for mac_key in _key_alts(raw_key)]
+        for blob in blobs:
+            plains = [blob] if len(blob) >= 48 else []
+            chunks = (blob[4:], blob) if len(blob) > 4 else (blob,)
+            for chunk in chunks:
+                if not chunk or len(chunk) % 16:
+                    continue
+                try:
+                    plains.append(_unpad(_aes(aes_key, chunk, decrypt=True)))
+                except Exception:
+                    pass
+                if len(chunk) >= 32 and (len(chunk) - 16) % 16 == 0:
+                    try:
+                        plains.append(_unpad(_cbc(aes_key, chunk[:16], chunk[16:])))
+                    except Exception:
+                        pass
+            for plain in plains:
+                if len(plain) < 48:
+                    continue
+                signed = [hmac.new(mac_key, plain[:16], hashlib.sha256).digest() for mac_key in _key_alts(raw_key)]
+                if plain[16:48] in checks or plain[16:48] in signed:
+                    return plain[:16], aes_key
+                if plain[:32] in checks:
+                    return plain[32:48], aes_key
+    return None
 
 
 def _frame_body(data: bytes) -> tuple[int, bytes] | None:
@@ -415,20 +501,53 @@ def _open_session(sock: socket.socket, raw_key: bytes, *, encrypt: bool = True) 
         data = _read_frame(sock)
     except OSError:
         return None
-    remote = _remote_nonce(data, raw_key, nonce)
-    if not remote:
+    opened = _remote_nonce(data, raw_key, nonce)
+    if not opened:
         return None
+    remote, aes_key = opened
     finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
     try:
-        sock.sendall(pack_signed(2, 5, _aes(raw_key, _pad(finish)), raw_key))
+        sock.sendall(pack_signed(2, 5, _aes(aes_key, _pad(finish)), raw_key))
         _read_frame(sock)
     except OSError:
         pass
     mixed = bytes(left ^ right for left, right in zip(nonce, remote))
-    return _aes(raw_key, mixed)
+    return _aes(aes_key, mixed)
+
+
+def _open_session_35(sock: socket.socket, raw_key: bytes) -> bytes | None:
+    nonce = os.urandom(16)
+    try:
+        sock.sendall(pack_35(1, 3, nonce, raw_key))
+        opened = unpack_35(_read_any(sock), raw_key)
+    except OSError:
+        return None
+    if not opened or opened[0] not in {3, 4} or len(opened[1]) < 48:
+        return None
+    remote = opened[1][:16]
+    check = hmac.new(raw_key, nonce, hashlib.sha256).digest()
+    if opened[1][16:48] != check:
+        return None
+    finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
+    try:
+        sock.sendall(pack_35(2, 5, finish, raw_key))
+        _read_any(sock)
+    except OSError:
+        pass
+    mixed = bytes(left ^ right for left, right in zip(nonce, remote))
+    return _gcm(raw_key, nonce[:12], mixed, b"")[:16]
 
 
 def _session_kind(ip: str, raw_key: bytes) -> str | None:
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
+    except OSError:
+        return "down"
+    try:
+        if _open_session_35(sock, raw_key):
+            return "3.5"
+    finally:
+        sock.close()
     for encrypt in (True, False):
         try:
             sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
@@ -473,12 +592,72 @@ def _materials(devices: dict[str, dict[str, Any]]) -> list[tuple[str, str, bytes
     return [(dev_id, label, raw) for _rank, dev_id, label, raw in ranked]
 
 
-def _clue(ip: str, raw_key: bytes) -> str:
+def _census(body: bytes, keys: list[bytes]) -> str:
+    ecb = md5_hits = cbc_hits = zero_hits = 0
+    unique: list[bytes] = []
+    for key in keys:
+        if key not in unique:
+            unique.append(key)
+    zero = b"\x00" * 16
+    for key in unique:
+        digest = hashlib.md5(key).digest()
+        if body and len(body) % 16 == 0:
+            for secret, slot in ((key, "ecb"), (digest, "md5")):
+                try:
+                    if _padded(_aes(secret, body, decrypt=True)):
+                        if slot == "ecb":
+                            ecb += 1
+                        else:
+                            md5_hits += 1
+                except Exception:
+                    pass
+            try:
+                if _padded(_cbc(key, zero, body)):
+                    zero_hits += 1
+            except Exception:
+                pass
+        if len(body) >= 32 and (len(body) - 16) % 16 == 0:
+            try:
+                if _padded(_cbc(key, body[:16], body[16:])):
+                    cbc_hits += 1
+            except Exception:
+                pass
+    return f"ECB{ecb} MD5{md5_hits} CBC{cbc_hits} 零IV{zero_hits} 共{len(unique)}"
+
+
+def _frame_name(data: bytes) -> str:
+    if data.startswith(PREFIX35):
+        return "6699"
+    if data.startswith(PREFIX):
+        return "55aa"
+    return f"{len(data)}字节"
+
+
+def _clue(ip: str, keys: list[bytes]) -> str:
+    raw_key = keys[0]
     nonce = os.urandom(16)
     try:
         sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
     except OSError:
         return "连不上"
+    try:
+        sock.sendall(pack_35(1, 3, nonce, raw_key))
+        newer = _read_any(sock)
+    except OSError:
+        newer = b""
+    finally:
+        sock.close()
+    if unpack_35(newer, raw_key):
+        newer_note = "3.5解开"
+    elif newer.startswith(PREFIX35):
+        newer_note = "3.5标签失败"
+    else:
+        newer_note = f"3.5回{_frame_name(newer)}"
+    nonce = os.urandom(16)
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
+    except OSError:
+        return f"{newer_note} 连不上"
     try:
         sock.sendall(pack_signed(1, 3, _aes(raw_key, nonce), raw_key))
         data = _read_frame(sock)
@@ -487,23 +666,33 @@ def _clue(ip: str, raw_key: bytes) -> str:
     finally:
         sock.close()
     if len(data) < 16 or not data.startswith(PREFIX):
-        return f"会话回{len(data)}字节 {data[:8].hex()}"
+        return f"{newer_note} 会话回{len(data)}字节 {data[:8].hex()}"
     command, length = struct.unpack(">II", data[8:16])
     frame = data[: 16 + length]
-    kind = "不能解密"
-    body = frame[16:-8] if frame.endswith(SUFFIX) else b""
-    if body and len(body) % 16 == 0:
-        try:
-            plain = _unpad(_aes(raw_key, body, decrypt=True))
-        except Exception:
-            plain = b""
-        if plain.startswith((b"{", b"[")):
-            kind = "解密为json"
-        elif plain and all(32 <= byte < 127 for byte in plain[:8]):
-            kind = "解密为文本"
-        elif plain:
-            kind = "解密为二进制"
-    return f"会话回{len(data)} 命令{command} 长度{length} 尾{data[-4:].hex()} {kind}"
+    body = frame[16:-8] if len(frame) >= 24 and frame.endswith(SUFFIX) else b""
+    return f"{newer_note} 会话回{len(data)} 命令{command} 长度{length} {_census(body, keys)}"
+
+
+def _publish_35(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any]) -> str:
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=3)
+    except OSError:
+        return "连接失败"
+    try:
+        session = _open_session_35(sock, raw_key)
+        if not session:
+            return "会话失败"
+        raw = b"3.5" + (b"\x00" * 12) + json.dumps(
+            control_34(cid, dps, int(time.time())),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        sock.sendall(pack_35(3, CONTROL_NEW, raw, session))
+    except OSError:
+        return "连接失败"
+    finally:
+        sock.close()
+    return "sent"
 
 
 def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
@@ -599,7 +788,8 @@ def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]]
             break
     where = "、".join(open_ips[:4])
     forms = ",".join(dict.fromkeys(label for _dev, label, _raw in materials))
-    peek = _clue(open_ips[0], materials[0][2]) if open_ips and materials and not found else ""
+    local_keys = [raw for _dev, label, raw in materials if label == "localKey"]
+    peek = _clue(open_ips[0], local_keys) if open_ips and local_keys and not found else ""
     note = (
         f"本机 {local}，扫描 {','.join(bases)}，6668 开放 {len(open_ips)}"
         + (f"（{where}）" if where else "")
@@ -687,10 +877,10 @@ def publish_local(
         return "没有本地密钥"
     version = str(found.get("version") or "")
     ip = found.get("ip") or _private_ip(owner.get("ip"))
+    if version.startswith("3.5") and ip:
+        return _publish_35(ip, raw_key, cid, dps)
     if version.startswith("3.4") and ip:
         return _publish_34(ip, raw_key, cid, dps, plain=version == "3.4p")
-    if version.startswith("3.5"):
-        return f"网关协议 {version}"
     if not ip:
         return "没有发现网关"
     frame = pack_33(1, CONTROL_NEW, control_body(cid, dps, int(time.time())), raw_key.decode("latin-1"))
@@ -742,6 +932,14 @@ def _self_check() -> None:
     assert forms[0][0] == "localKey" and ("localKey.b64", b"0123456789abcdef") in forms
     assert _materials({"g": {"devId": "g", "category": "jzq", "localKey": "0123456789abcdef", "devKey": "abcdef0123456789"}})[1][1] == "devKey"
     assert _mac_note({}, "127.0.0.1") in {"没有 ARP", "没有读到 MAC", "MAC 不在设备名单里"}
+    assert len(_key_alts(b"0123456789abcdef")) == 2
+    assert _padded(b"\x04\x04\x04\x04") and not _padded(b"\x01\x02")
+    sample = b"0123456789abcdef"
+    sealed = pack_35(7, 3, sample, sample, iv=b"0123456789ab")
+    assert sealed.startswith(PREFIX35) and sealed.endswith(SUFFIX35)
+    assert unpack_35(sealed, sample) == (3, sample)
+    assert unpack_35(sealed, b"abcdef0123456789") is None
+    assert len(_gcm(sample, b"0123456789ab", sample, b"")) == 32
     print("lan self-check ok")
 
 
