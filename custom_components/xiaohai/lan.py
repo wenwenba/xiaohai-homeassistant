@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import binascii
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import hmac
 import json
 import os
 import select
@@ -326,6 +328,119 @@ def _probe(ip: str, key: str) -> bool:
     return _accepts(data, key)
 
 
+def pack_signed(seq: int, command: int, payload: bytes, key: bytes) -> bytes:
+    """3.4 frame: HMAC-SHA256 instead of the CRC used by 3.3."""
+    head = PREFIX + struct.pack(">III", seq, command, len(payload) + 36) + payload
+    digest = hmac.new(key, head, hashlib.sha256).digest()
+    return head + digest + SUFFIX
+
+
+def control_34(cid: str, dps: dict[str, Any], now: int) -> dict[str, Any]:
+    data: dict[str, Any] = {"dps": dps}
+    if cid:
+        data["cid"] = cid
+    return {"protocol": 5, "t": now, "data": data}
+
+
+def _read_frame(sock: socket.socket) -> bytes:
+    sock.settimeout(1.2)
+    data = b""
+    while len(data) < 16:
+        chunk = sock.recv(1024)
+        if not chunk:
+            return data
+        data += chunk
+    if not data.startswith(PREFIX):
+        return data
+    total = 16 + struct.unpack(">I", data[12:16])[0]
+    while len(data) < total:
+        chunk = sock.recv(1024)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def _frame_body(data: bytes) -> tuple[int, bytes] | None:
+    if len(data) < 52 or not data.startswith(PREFIX) or not data.endswith(SUFFIX):
+        return None
+    length = struct.unpack(">I", data[12:16])[0]
+    frame = data[: 16 + length]
+    if len(frame) < 52 or not frame.endswith(SUFFIX):
+        return None
+    command = struct.unpack(">I", frame[8:12])[0]
+    return command, frame[16:-36]
+
+
+def _open_session(sock: socket.socket, key: str) -> bytes | None:
+    raw_key = key.encode("utf-8")[:16]
+    nonce = os.urandom(16)
+    try:
+        sock.sendall(pack_signed(1, 3, _aes(raw_key, nonce), raw_key))
+        data = _read_frame(sock)
+    except OSError:
+        return None
+    parts = _frame_body(data)
+    if not parts or parts[0] != 4:
+        return None
+    blob = parts[1]
+    remote = b""
+    for chunk in (blob[4:], blob) if len(blob) > 4 else (blob,):
+        if not chunk or len(chunk) % 16:
+            continue
+        try:
+            plain = _unpad(_aes(raw_key, chunk, decrypt=True))
+        except Exception:
+            continue
+        check = hmac.new(raw_key, nonce, hashlib.sha256).digest()
+        if len(plain) >= 48 and plain[16:48] == check:
+            remote = plain[:16]
+            break
+    if not remote:
+        return None
+    finish = hmac.new(raw_key, remote, hashlib.sha256).digest()
+    try:
+        sock.sendall(pack_signed(2, 5, _aes(raw_key, _pad(finish)), raw_key))
+        _read_frame(sock)
+    except OSError:
+        pass
+    mixed = bytes(left ^ right for left, right in zip(nonce, remote))
+    return _aes(raw_key, mixed)
+
+
+def _session_matches(ip: str, key: str) -> bool:
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=0.8)
+    except OSError:
+        return False
+    try:
+        return _open_session(sock, key) is not None
+    finally:
+        sock.close()
+
+
+def _publish_34(ip: str, key: str, cid: str, dps: dict[str, Any]) -> str:
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=3)
+    except OSError:
+        return "连接失败"
+    try:
+        session = _open_session(sock, key)
+        if not session:
+            return "会话失败"
+        raw = b"3.4" + (b"\x00" * 12) + json.dumps(
+            control_34(cid, dps, int(time.time())),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        sock.sendall(pack_signed(3, CONTROL_NEW, _aes(session, _pad(raw)), session))
+    except OSError:
+        return "连接失败"
+    finally:
+        sock.close()
+    return "sent"
+
+
 def _peek(ip: str, key: str) -> str:
     frame = pack_33(2, 9, {"t": int(time.time())}, key)
     try:
@@ -350,8 +465,7 @@ def _peek(ip: str, key: str) -> str:
 def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]], str]:
     """Find gateways by who answers on TCP 6668 with a key from the cloud list.
 
-    shortcut: only the /24s this host can see, and only gateway products.
-    A device that does not speak protocol 3.3 stays on the cloud.
+    shortcut: only the /24s this host can see. Protocol 3.3 first, then a 3.4 session.
     """
     local, bases = _networks()
     if not bases:
@@ -367,14 +481,19 @@ def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]]
     found: dict[str, dict[str, str]] = {}
     for ip in open_ips[:8]:
         for dev_id, key in keys:
-            if dev_id in found:
-                continue
-            if _probe(ip, key):
-                found[dev_id] = {"ip": ip, "version": "3.3"}
+            if _session_matches(ip, key):
+                found[dev_id] = {"ip": ip, "version": "3.4", "dev": dev_id}
                 break
-    peek = _peek(open_ips[0], keys[0][1]) if open_ips and keys and not found else ""
+            if _probe(ip, key):
+                found[dev_id] = {"ip": ip, "version": "3.3", "dev": dev_id}
+                break
+    where = "、".join(open_ips[:4])
+    peek = ""
+    if open_ips and keys and not found:
+        peek = _peek(open_ips[0], keys[0][1])
     note = (
         f"本机 {local}，扫描 {','.join(bases)}，6668 开放 {len(open_ips)}"
+        + (f"（{where}）" if where else "")
         + (f"，{peek}" if peek else "")
     )
     return found, note
@@ -443,15 +562,19 @@ def publish_local(
     gateway_id, cid = route(device)
     if gateway_id != str(device.get("devId") or "") and not cid:
         return "没有子设备编号"
-    gateway = devices.get(gateway_id) or device
-    key = gateway.get("localKey")
+    found = lan.get(gateway_id) or {}
+    if not found and len(lan) == 1:
+        found = next(iter(lan.values()))
+    owner = devices.get(str(found.get("dev") or "")) or devices.get(gateway_id) or device
+    key = owner.get("localKey")
     if not isinstance(key, str) or len(key) < 16:
         return "没有本地密钥"
-    found = lan.get(gateway_id) or {}
     version = str(found.get("version") or "")
-    if version.startswith("3.4") or version.startswith("3.5"):
+    ip = found.get("ip") or _private_ip(owner.get("ip"))
+    if version.startswith("3.4") and ip:
+        return _publish_34(ip, key[:16], cid, dps)
+    if version.startswith("3.5"):
         return f"网关协议 {version}"
-    ip = found.get("ip") or _private_ip(gateway.get("ip"))
     if not ip:
         return "没有发现网关"
     frame = pack_33(1, CONTROL_NEW, control_body(cid, dps, int(time.time())), key[:16])
@@ -495,6 +618,9 @@ def _self_check() -> None:
     assert len(hosts) == 254 and "192.168.50.0" not in hosts and "192.168.50.255" not in hosts
     assert _accepts(pack_33(2, 9, {"t": 1}, "0123456789abcdef"), "0123456789abcdef")
     assert not _accepts(pack_33(2, 9, {"t": 1}, "0123456789abcdef"), "abcdef0123456789")
+    signed = pack_signed(1, 3, b"\x11" * 16, b"0123456789abcdef")
+    assert signed.endswith(SUFFIX) and struct.unpack(">I", signed[12:16])[0] == 52
+    assert control_34("abcd", {"1": True}, 1)["data"]["cid"] == "abcd"
     print("lan self-check ok")
 
 
