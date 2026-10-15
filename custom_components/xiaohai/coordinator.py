@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import timedelta
 import logging
-import time
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
@@ -13,7 +12,6 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
 from .dp import device_id_from_unique_id
-from .lan import discover_gateways, private_gateway_ips
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,8 +29,6 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self.client = client
         self._room_warned = False
         self._device_ids: tuple[str, ...] = ()
-        self._ip_logged = False
-        self._lan_at = 0.0
 
     async def _async_update_data(self) -> dict[str, dict]:
         try:
@@ -73,35 +69,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             _LOGGER.info("已从云端获取 %s 台设备", len(ids))
             self._device_ids = ids
         self.client.devices = indexed
-        if not self._ip_logged:
-            ips = private_gateway_ips(indexed)
-            _LOGGER.warning("云端给出的网关局域网地址：%s", "、".join(ips) or "无")
-            self._ip_logged = True
-        await self._async_discover()
         return indexed
-
-    async def _async_discover(self) -> None:
-        """Look for the gateway on the LAN. Repeat until one answers, then hourly."""
-        now = time.monotonic()
-        wait = 3600 if self.client.lan else 600
-        if self._lan_at and now - self._lan_at < wait:
-            return
-        try:
-            found, note = await self.hass.async_add_executor_job(
-                discover_gateways, self.client.devices
-            )
-        except OSError as err:
-            _LOGGER.warning("局域网发现失败：%s", err)
-            return
-        changed = found != self.client.lan or self._lan_at == 0.0
-        self._lan_at = now
-        self.client.lan = found
-        if changed:
-            summary = ", ".join(
-                f"{item['ip']} {item.get('version') or ''}".strip() for item in found.values()
-            )
-            extra = f"：{summary}" if summary else ""
-            _LOGGER.warning("局域网发现 %s 台网关%s%s", len(found), extra, f" {note}" if note else "")
 
 
 def async_assign_areas(hass: HomeAssistant, devices: dict[str, dict]) -> None:
