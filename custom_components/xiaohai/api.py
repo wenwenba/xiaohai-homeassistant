@@ -135,8 +135,8 @@ class XiaohaiClient:
     async def async_device_rooms(self, gid: Any) -> dict[str, str]:
         """Map devId to the cloud room name.
 
-        shortcut: only the room list and the device sort list. A roomId of -1
-        means the app has not placed that device in a room.
+        shortcut: membership comes from the relation list. A device absent
+        there stays unassigned, same as the app.
         """
         gid_s = str(gid)
         listed = await self._request(
