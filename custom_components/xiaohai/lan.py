@@ -423,8 +423,8 @@ def _read_any(sock: socket.socket) -> bytes:
     return data
 
 
-def _read_frame(sock: socket.socket) -> bytes:
-    sock.settimeout(1.2)
+def _read_frame(sock: socket.socket, timeout: float = 1.2) -> bytes:
+    sock.settimeout(timeout)
     data = b""
     while len(data) < 16:
         chunk = sock.recv(1024)
@@ -736,36 +736,105 @@ def _publish_35(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any]) -> str:
     return "sent"
 
 
-def _exchange(ip: str, frame: bytes, key: bytes) -> bool:
-    try:
-        sock = socket.create_connection((ip, TCP_PORT), timeout=3)
-    except OSError:
+def _shape(data: bytes, key: bytes) -> str:
+    """Reply outline only: length, command, and whether the signature matches."""
+    if not data:
+        return "回0"
+    if len(data) < 16 or not data.startswith(PREFIX):
+        return f"回{len(data)}非帧"
+    command, length = struct.unpack(">II", data[8:16])
+    frame = data[: 16 + length] if len(data) >= 16 + length else data
+    marks: list[str] = []
+    if (
+        len(frame) >= 52
+        and frame.endswith(SUFFIX)
+        and hmac.new(key, frame[:-36], hashlib.sha256).digest() == frame[-36:-4]
+    ):
+        marks.append("签名")
+    if (
+        len(frame) >= 24
+        and frame.endswith(SUFFIX)
+        and (binascii.crc32(frame[:-8]) & 0xFFFFFFFF) == struct.unpack(">I", frame[-8:-4])[0]
+    ):
+        marks.append("CRC")
+    code = struct.unpack(">I", frame[16:20])[0] if len(frame) >= 20 else -1
+    return f"回{len(data)}命令{command}{'/'.join(marks) or '无校验'}码{code}"
+
+
+def _crc_ok(data: bytes, key: bytes) -> bool:
+    if len(data) < 24 or not data.startswith(PREFIX):
+        return False
+    length = struct.unpack(">I", data[12:16])[0]
+    frame = data[: 16 + length]
+    if len(frame) < 24 or not frame.endswith(SUFFIX):
+        return False
+    if (binascii.crc32(frame[:-8]) & 0xFFFFFFFF) != struct.unpack(">I", frame[-8:-4])[0]:
+        return False
+    payload = frame[16:-8]
+    if payload.startswith(b"3.3") or payload.startswith(b"3.4"):
+        payload = payload[15:]
+    if not payload or len(payload) % 16:
         return False
     try:
-        sock.sendall(frame)
-        return _accepted(_read_frame(sock), key)
-    except OSError:
+        plain = _unpad(_aes(key[:16], payload, decrypt=True))
+    except Exception:
         return False
-    finally:
-        sock.close()
+    return plain.startswith(b"{") and b"unvalid" not in plain and b"error" not in plain.lower()
 
 
 def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
+    """Handshake and control share one connection. A fresh control write is ignored."""
     now = int(time.time())
-    bodies = [
-        b"3.4" + (b"\x00" * 12) + json.dumps(
-            control_34(cid, dps, now),
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode(),
-        json.dumps(control_body(cid, dps, now), separators=(",", ":"), ensure_ascii=False).encode(),
-    ]
+    wrapped = b"3.4" + (b"\x00" * 12) + json.dumps(
+        control_34(cid, dps, now),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
     if plain:
-        bodies.reverse()
-    for body in bodies:
-        if _exchange(ip, _local_command(raw_key, body), raw_key):
+        wrapped = json.dumps(control_body(cid, dps, now), separators=(",", ":"), ensure_ascii=False).encode()
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=3)
+    except OSError:
+        return "连接失败"
+    notes: list[str] = []
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        opened = _open_session(sock, raw_key, encrypt=not plain)
+        if not opened:
+            return "会话失败"
+        session, _remote = opened
+        frames = [
+            pack_signed(2, CONTROL_NEW, _aes(raw_key, _pad(wrapped)), raw_key),
+            pack_signed(3, CONTROL_NEW, _aes(session, _pad(wrapped)), session),
+        ]
+        for frame in frames:
+            try:
+                sock.sendall(frame)
+                data = _read_frame(sock, 2.5)
+            except OSError:
+                notes.append("断开")
+                break
+            notes.append(_shape(data, raw_key))
+            if _accepted(data, raw_key) or _accepted(data, session) or _crc_ok(data, raw_key):
+                return "sent"
+    finally:
+        sock.close()
+    try:
+        sock = socket.create_connection((ip, TCP_PORT), timeout=3)
+    except OSError:
+        return "网关未确认 " + " ".join(notes)
+    try:
+        sock.sendall(pack_33(4, CONTROL_NEW, control_body(cid, dps, now), raw_key.decode("latin-1")))
+        data = _read_frame(sock, 2.5)
+    except OSError:
+        notes.append("CRC断开")
+    else:
+        notes.append("CRC" + _shape(data, raw_key))
+        if _crc_ok(data, raw_key) or _accepted(data, raw_key):
             return "sent"
-    return "网关未确认"
+    finally:
+        sock.close()
+    return "网关未确认 " + " ".join(notes)
 
 
 def _peek(ip: str, key: str) -> str:
@@ -1006,6 +1075,8 @@ def _self_check() -> None:
     assert not _accepted(bad, sample)
     assert not _accepted(ok, b"abcdef0123456789")
     assert not _accepted(b"", sample)
+    assert _shape(b"", sample) == "回0"
+    assert "签名" in _shape(ok, sample)
     print("lan self-check ok")
 
 
