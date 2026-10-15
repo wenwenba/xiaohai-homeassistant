@@ -549,6 +549,27 @@ def _peek(ip: str, key: str) -> str:
     return f"命令{command} {data[16:19].hex()}"
 
 
+def _mac_note(devices: dict[str, dict[str, Any]], ip: str) -> str:
+    """Say whether this host is one of the cloud devices, without logging the MAC."""
+    try:
+        rows = open("/proc/net/arp", encoding="utf-8").read().splitlines()[1:]
+    except OSError:
+        return "没有 ARP"
+    mac = ""
+    for row in rows:
+        parts = row.split()
+        if len(parts) >= 4 and parts[0] == ip:
+            mac = parts[3].lower().replace("-", ":")
+            break
+    if not mac or mac == "00:00:00:00:00:00":
+        return "没有读到 MAC"
+    for device in devices.values():
+        own = str(device.get("mac") or "").lower().replace("-", ":")
+        if own and own == mac:
+            return "MAC 与设备名单一致"
+    return "MAC 不在设备名单里"
+
+
 def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]], str]:
     """Find gateways by who answers on TCP 6668 with a key from the cloud list.
 
@@ -584,6 +605,7 @@ def _scan(devices: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]]
         + (f"（{where}）" if where else "")
         + (f"，密钥 {forms}" if forms else "")
         + (f"，{peek}" if peek else "")
+        + (f"，{_mac_note(devices, open_ips[0])}" if open_ips else "")
     )
     return found, note
 
@@ -719,6 +741,7 @@ def _self_check() -> None:
     forms = _key_materials(coded, "localKey")
     assert forms[0][0] == "localKey" and ("localKey.b64", b"0123456789abcdef") in forms
     assert _materials({"g": {"devId": "g", "category": "jzq", "localKey": "0123456789abcdef", "devKey": "abcdef0123456789"}})[1][1] == "devKey"
+    assert _mac_note({}, "127.0.0.1") in {"没有 ARP", "没有读到 MAC", "MAC 不在设备名单里"}
     print("lan self-check ok")
 
 
