@@ -806,54 +806,9 @@ def _swap_frames(raw_key: bytes, nonce: bytes, remote: bytes, plain: bytes) -> t
     return done, command, session
 
 
-def _frame_command(data: bytes) -> int:
-    if len(data) < 12 or not data.startswith(PREFIX):
-        return -1
-    return struct.unpack(">I", data[8:12])[0]
-
-
 def _publish_34(ip: str, raw_key: bytes, cid: str, dps: dict[str, Any], *, plain: bool = False) -> str:
-    """Finish the key swap, then send control on that same connection."""
-    now = int(time.time())
-    body = control_body(cid, dps, now) if plain else control_34(cid, dps, now)
-    wrapped = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
-    if not plain:
-        wrapped = b"3.4" + (b"\x00" * 12) + wrapped
-    nonce = os.urandom(16)
-    try:
-        sock = socket.create_connection((ip, TCP_PORT), timeout=3)
-    except OSError:
-        return "连接失败"
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.sendall(pack_signed(1, 3, _aes(raw_key, nonce), raw_key))
-        remote = _signed_nonce(_read_frame(sock), raw_key)
-        if len(remote) != 16:
-            return "会话失败"
-        done, command, session = _swap_frames(raw_key, nonce, remote, wrapped)
-        sock.sendall(done)
-        step = _read_frame(sock, 2.5)
-        if _signed_code(step, raw_key) != 0:
-            return "网关未确认 " + _shape(step, raw_key)
-        sock.sendall(command)
-        first = _read_frame(sock, 2.5)
-        try:
-            second = _read_frame(sock, 1.2)
-        except OSError:
-            second = b""
-    except OSError:
-        return "连接失败"
-    finally:
-        sock.close()
-
-    def accepted(data: bytes) -> bool:
-        if _frame_command(data) in {3, 5}:
-            return False
-        return _accepted(data, raw_key) or _accepted(data, session) or _crc_ok(data, raw_key)
-
-    if accepted(first) or accepted(second):
-        return "sent"
-    return "网关未确认 " + _shape(first, raw_key) + " " + _shape(second, session)
+    """This gateway has one local session. Negotiating another one drops the phone app."""
+    return "本地会话会把手机App踢下线"
 
 
 def _peek(ip: str, key: str) -> str:
@@ -1097,6 +1052,7 @@ def _self_check() -> None:
     bad += hmac.new(sample, bad, hashlib.sha256).digest() + SUFFIX
     assert _accepted(ok, sample)
     assert _signed_code(ok, sample) == 0 and _signed_code(bad, sample) == 1
+    assert _publish_34("127.0.0.1", sample, "cid", {"1": False}) == "本地会话会把手机App踢下线"
     assert not _accepted(bad, sample)
     assert not _accepted(ok, b"abcdef0123456789")
     assert not _accepted(b"", sample)
