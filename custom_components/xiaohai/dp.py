@@ -369,6 +369,19 @@ def _item_dp(item: dict, code: str | None) -> str | None:
     return None
 
 
+def panel_speeds(current: Any, values: list[str] | None = None) -> list[str]:
+    """Speeds for one slider.
+
+    level1, level2 and level3 is the spelling this fresh-air panel reports.
+    The app only has low and high, and those are the first two.
+    """
+    choices = speed_choices(current, values) or []
+    ordered = [choice for choice in choices if choice not in {"off", "close"}]
+    if ordered and all(re.fullmatch(r"level\d+", item) for item in ordered):
+        return ["level1", "level2"]
+    return ordered
+
+
 def speed_choices(current: Any, values: list[str] | None = None) -> list[str] | None:
     """Fan speeds from the cloud enum. The current value is kept visible."""
     text = "" if current is None else str(current)
@@ -735,6 +748,8 @@ def _self_check() -> None:
     reported = profile({"_schema": {"switch": "1"}, "dps": {"1": False, "12": "level1", "9": 22}})
     assert reported["kind"] == "fan" and reported["power"] == "1" and reported["fan"] == "12"
     assert reported["fan_values"] == ["level1", "level2"]
+    assert panel_speeds("level1", ["level1", "level2", "level3"]) == ["level1", "level2"]
+    assert panel_speeds("level_1", ["level_1", "level_2", "level_3"]) == ["level_1", "level_2", "level_3"]
 
 
 if __name__ == "__main__":

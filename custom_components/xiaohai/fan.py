@@ -17,7 +17,7 @@ from homeassistant.util.percentage import (
 from . import XiaohaiConfigEntry
 from .const import DOMAIN
 from .coordinator import XiaohaiCoordinator
-from .dp import dp_value, profile, speed_choices
+from .dp import dp_value, panel_speeds, profile
 from .entity import XiaohaiEntity, take_new_entities
 
 
@@ -60,8 +60,7 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
         return profile(self.device) or {}
 
     def _ordered(self) -> list[str]:
-        choices = speed_choices(dp_value(self.device, self._spec.get("fan")), self._spec.get("fan_values")) or []
-        return [choice for choice in choices if choice not in {"off", "close"}]
+        return panel_speeds(dp_value(self.device, self._spec.get("fan")), self._spec.get("fan_values"))
 
     @property
     def supported_features(self) -> FanEntityFeature:
