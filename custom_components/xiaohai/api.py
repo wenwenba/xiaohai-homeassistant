@@ -194,6 +194,20 @@ class XiaohaiClient:
                 devices.append(device)
         return devices
 
+    async def async_group_device(self, gid: Any, dev_id: str) -> dict[str, Any] | None:
+        """One device from the group list, including its current datapoints."""
+        listed = await self._request(
+            "tuya.m.my.group.device.list",
+            None,
+            extra_params={"gid": str(gid)},
+        )
+        if isinstance(listed, dict):
+            listed = listed.get("devices") or listed.get("list") or []
+        for device in listed or []:
+            if isinstance(device, dict) and device.get("devId") == dev_id:
+                return device
+        return None
+
     async def async_device_rooms(self, gid: Any) -> dict[str, str]:
         """Map devId to the cloud room name.
 

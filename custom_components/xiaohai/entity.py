@@ -68,9 +68,14 @@ class XiaohaiEntity(CoordinatorEntity[XiaohaiCoordinator]):
 
     async def async_publish(self, dps: dict[str, Any]) -> None:
         device = dict(self.device)
+        before = dict(device.get("dps") or {})
         await self.coordinator.client.async_publish(device, dps)
-        merged = dict(device.get("dps") or {})
+        merged = dict(before)
         merged.update({str(key): value for key, value in dps.items()})
         device["dps"] = merged
-        self.coordinator.data[self._dev_id] = device
-        self.async_write_ha_state()
+        data = self.coordinator.data
+        if data is None:
+            return
+        data[self._dev_id] = device
+        self.coordinator.async_set_updated_data(data)
+        self.coordinator.schedule_device_sync(self._dev_id, before, dps)

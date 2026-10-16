@@ -55,6 +55,17 @@ def scaled(value: Any, scale: int | None = None) -> float | None:
     return float(value)
 
 
+def merge_command_dps(before: dict, written: dict, reported: dict) -> dict[str, Any]:
+    """Cloud report wins, except a key we just wrote that the cloud has not moved yet."""
+    prior = {str(key): value for key, value in before.items()}
+    sent = {str(key): value for key, value in written.items()}
+    merged = {str(key): value for key, value in reported.items()}
+    for key, value in sent.items():
+        if key not in merged or merged[key] == prior.get(key):
+            merged[key] = value
+    return merged
+
+
 def dp_value(device: dict, dp: str | None) -> Any:
     if not dp:
         return None
@@ -921,6 +932,11 @@ def _self_check() -> None:
         "level_5",
     ]
     assert offers_speed_auto({"_schema": ac_schema, "dps": {"5": "auto", "107": three_mask}})
+    assert merge_command_dps({"4": "cold", "5": "level_1"}, {"4": "wind"}, {"4": "cold", "5": "auto"}) == {
+        "4": "wind",
+        "5": "auto",
+    }
+    assert merge_command_dps({4: "cold"}, {4: "wind"}, {"4": "wind"}) == {"4": "wind"}
     three = {
         "mode": "4",
         "@range:mode": "[\"auto\",\"cold\",\"hot\",\"wet\",\"wind\"]",

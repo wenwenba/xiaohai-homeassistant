@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
+import json
 import logging
 
 from homeassistant.core import HomeAssistant
@@ -11,7 +13,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import apply_panel_schema, device_id_from_unique_id, profile
+from .dp import apply_panel_schema, device_id_from_unique_id, merge_command_dps, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +34,71 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self._fan_noted = False
         self._ver_noted = False
         self._device_ids: tuple[str, ...] = ()
+        self._sync_tasks: dict[str, asyncio.Task] = {}
+        self._sync_token: dict[str, int] = {}
+        self._pending_before: dict[str, dict] = {}
+        self._pending_write: dict[str, dict] = {}
+
+    def schedule_device_sync(self, dev_id: str, before: dict, written: dict) -> None:
+        """Pull this device once, after a short wait, so related datapoints catch up.
+
+        shortcut: one group-list read a second later. A report that arrives after
+        that still waits for the normal poll. A rejected write stays until then too.
+        """
+        if dev_id not in self._pending_before:
+            self._pending_before[dev_id] = {str(key): value for key, value in before.items()}
+        pending = self._pending_write.setdefault(dev_id, {})
+        pending.update({str(key): value for key, value in written.items()})
+        self._sync_token[dev_id] = self._sync_token.get(dev_id, 0) + 1
+        token = self._sync_token[dev_id]
+        previous = self._sync_tasks.pop(dev_id, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._sync_tasks[dev_id] = self.hass.async_create_task(self._sync_device(dev_id, token))
+
+    async def _sync_device(self, dev_id: str, token: int) -> None:
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
+        if self._sync_token.get(dev_id) != token or not self.data or dev_id not in self.data:
+            return
+        current = self.data[dev_id]
+        gid = current.get("_group_id") if isinstance(current, dict) else None
+        if gid is None:
+            self._pending_before.pop(dev_id, None)
+            self._pending_write.pop(dev_id, None)
+            return
+        try:
+            fresh = await self.client.async_group_device(gid, dev_id)
+        except XiaohaiError:
+            fresh = None
+        if self._sync_token.get(dev_id) != token or not self.data or dev_id not in self.data:
+            return
+        before = self._pending_before.pop(dev_id, {})
+        written = self._pending_write.pop(dev_id, {})
+        if not isinstance(fresh, dict):
+            return
+        updated = dict(self.data[dev_id])
+        reported = fresh.get("dps")
+        if isinstance(reported, str):
+            try:
+                reported = json.loads(reported)
+            except json.JSONDecodeError:
+                reported = None
+        if isinstance(reported, dict):
+            updated["dps"] = merge_command_dps(before, written, reported)
+        for key in ("isOnline", "moduleMap"):
+            if key in fresh:
+                updated[key] = fresh[key]
+        self.data[dev_id] = updated
+        self.async_set_updated_data(self.data)
+
+    async def async_shutdown(self) -> None:
+        for task in list(self._sync_tasks.values()):
+            task.cancel()
+        self._sync_tasks.clear()
+        await super().async_shutdown()
 
     async def _async_update_data(self) -> dict[str, dict]:
         try:
@@ -148,6 +215,11 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                     " ".join(samples),
                 )
             self._speed_noted = True
+        for dev_id, written in self._pending_write.items():
+            device = indexed.get(dev_id)
+            reported = device.get("dps") if isinstance(device, dict) else None
+            if isinstance(reported, dict):
+                device["dps"] = merge_command_dps(self._pending_before.get(dev_id) or {}, written, reported)
         ids = tuple(sorted(indexed))
         if ids != self._device_ids:
             _LOGGER.info("已从云端获取 %s 台设备", len(ids))
