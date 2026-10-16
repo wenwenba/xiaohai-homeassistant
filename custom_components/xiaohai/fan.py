@@ -1,7 +1,7 @@
-"""Fresh air. One fan: on/off plus a speed slider.
+"""Fresh air and air-conditioner speed.
 
-HomeKit turns each preset into its own switch, so the cloud speeds are
-steps on a single slider instead.
+HomeKit turns two or more presets into switches. One preset named auto
+becomes the fan's Auto control, so air conditioners keep that and nothing else.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from homeassistant.util.percentage import (
 from . import XiaohaiConfigEntry
 from .const import DOMAIN
 from .coordinator import XiaohaiCoordinator
-from .dp import dp_value, profile, slider_speeds
+from .dp import dp_value, offers_speed_auto, profile, slider_speeds
 from .entity import XiaohaiEntity, take_new_entities
 
 
@@ -71,7 +71,19 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
         features = FanEntityFeature.TURN_ON | FanEntityFeature.TURN_OFF
         if self._ordered():
             features |= FanEntityFeature.SET_SPEED
+        if self.preset_modes:
+            features |= FanEntityFeature.PRESET_MODE
         return features
+
+    @property
+    def preset_modes(self) -> list[str] | None:
+        return ["auto"] if offers_speed_auto(self.device) else None
+
+    @property
+    def preset_mode(self) -> str | None:
+        if self.preset_modes and str(dp_value(self.device, self._spec.get("fan")) or "") == "auto":
+            return "auto"
+        return None
 
     @property
     def speed_count(self) -> int:
@@ -113,7 +125,20 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
         if dps:
             await self.async_publish(dps)
 
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        fan = self._spec.get("fan")
+        power = self._spec.get("power")
+        if preset_mode != "auto" or not fan:
+            return
+        dps: dict = {fan: "auto"}
+        if power:
+            dps[power] = True
+        await self.async_publish(dps)
+
     async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs) -> None:
+        if preset_mode:
+            await self.async_set_preset_mode(preset_mode)
+            return
         if percentage:
             await self.async_set_percentage(percentage)
             return

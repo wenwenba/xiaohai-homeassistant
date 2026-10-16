@@ -410,6 +410,15 @@ def apply_speed_mask(values: list[str], dps: Any) -> list[str]:
     return values if chosen is None else chosen
 
 
+def offers_speed_auto(device: dict) -> bool:
+    """The climate fan range still includes auto after the gear mask."""
+    spec = profile(device)
+    if not spec or spec.get("kind") != "climate" or not spec.get("fan"):
+        return False
+    values = apply_speed_mask(list(spec.get("fan_values") or []), device.get("dps"))
+    return "auto" in (speed_choices(dp_value(device, spec.get("fan")), values) or [])
+
+
 def slider_speeds(device: dict) -> list[str]:
     """Speeds for one fan slider.
 
@@ -911,6 +920,7 @@ def _self_check() -> None:
         "level_4",
         "level_5",
     ]
+    assert offers_speed_auto({"_schema": ac_schema, "dps": {"5": "auto", "107": three_mask}})
     three = {
         "mode": "4",
         "@range:mode": "[\"auto\",\"cold\",\"hot\",\"wet\",\"wind\"]",

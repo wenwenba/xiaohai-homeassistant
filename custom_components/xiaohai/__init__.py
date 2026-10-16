@@ -63,7 +63,11 @@ def _remove_legacy_switches(hass: HomeAssistant, entry_id: str) -> None:
     """Drop the old boolean-datapoint switches. Climate and fan replace them."""
     registry = er.async_get(hass)
     for entity in list(registry.entities.values()):
-        if entity.config_entry_id == entry_id and entity.domain == "switch":
+        if (
+            entity.config_entry_id == entry_id
+            and entity.domain == "switch"
+            and not str(entity.unique_id or "").endswith("_fan_only")
+        ):
             registry.async_remove(entity.entity_id)
 
 
