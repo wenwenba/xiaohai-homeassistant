@@ -22,6 +22,15 @@ _ASSIGNED = "xiaohai_homekit_assigned"
 _CHANGED = "xiaohai_homekit_changed"
 _STORE = "xiaohai_homekit_name_store"
 _AIDS_ROTATED = "xiaohai_homekit_aids_rotated"
+_SPEED_ROTATED = "xiaohai_homekit_speed_aids_rotated"
+# These two kept the shared Home name and iOS locked their settings.
+# The third id is the child-room fan before its entity id changed.
+_SPEED_ENTITY_IDS = (
+    "fan.ci_wo_kong_diao_feng_su",
+    "fan.wen_wen_kong_diao_kong_diao_1_feng_su",
+    "fan.wen_wen_kong_diao_feng_su",
+)
+_LOCKED_SPEED_NAME = "空调风速"
 _SKIP_SERVICES = {"HAPProtocolInformation"}
 _NAME_LIMIT = 64
 _PERMISSIONS = ["pr", "pw", "ev"]
@@ -61,6 +70,7 @@ def _stored(hass: HomeAssistant) -> dict:
     return {
         "names": dict(hass.data.get(_NAMES) or {}),
         "aids_rotated": bool(hass.data.get(_AIDS_ROTATED)),
+        "speed_aids_rotated": bool(hass.data.get(_SPEED_ROTATED)),
     }
 
 
@@ -237,6 +247,44 @@ async def _rotate_xiaohai_aids(
     return retired, others
 
 
+def _drop_locked_speed_names(hass: HomeAssistant) -> None:
+    names = hass.data.get(_NAMES)
+    if not isinstance(names, dict):
+        return
+    for entity_id in _SPEED_ENTITY_IDS:
+        if names.get(entity_id) == _LOCKED_SPEED_NAME:
+            names.pop(entity_id, None)
+
+
+async def _rotate_speed_aids(homekit: object) -> dict[str, int]:
+    """Give the locked speed fans a new aid, once.
+
+    Same rule as the first rotation: the old number stays reserved.
+    """
+    hass = homekit.hass
+    if hass.data.get(_SPEED_ROTATED):
+        return {}
+    storage = homekit.aid_storage
+    if storage is None:
+        return {}
+    retired: dict[str, int] = {}
+    for entity_id in _SPEED_ENTITY_IDS:
+        old = storage.get_allocated_aid_for_entity_id(entity_id)
+        if old is None:
+            continue
+        storage.async_delete_aid_for_entity_id(entity_id)
+        storage.allocations[f"xiaohai.retired.{old}"] = old
+        storage.allocated_aids.add(old)
+        retired[entity_id] = old
+    hass.data[_SPEED_ROTATED] = True
+    store: Store | None = hass.data.get(_STORE)
+    if store is not None:
+        await store.async_save(_stored(hass))
+    if retired:
+        await storage.async_save()
+    return retired
+
+
 def _install_name_source() -> bool:
     try:
         from homeassistant.components import homekit as hk
@@ -249,6 +297,7 @@ def _install_name_source() -> bool:
         async def _async_create_bridge_accessory(self, entity_states):
             states = list(entity_states)
             try:
+                _drop_locked_speed_names(self.hass)
                 _assign_names(self.hass, states, self._config)
                 _LOGGER.warning(
                     "xiaohai: 桥配件已按可写名称创建，%s 个重名已按区域区分",
@@ -262,6 +311,14 @@ def _install_name_source() -> bool:
                 retired, others = await _rotate_xiaohai_aids(self, states)
             except Exception:
                 _LOGGER.warning("xiaohai: 更换配件编号失败", exc_info=True)
+            try:
+                speed_retired = await _rotate_speed_aids(self)
+            except Exception:
+                speed_retired = {}
+                _LOGGER.warning("xiaohai: 更换风速配件编号失败", exc_info=True)
+            else:
+                if speed_retired:
+                    _LOGGER.warning("xiaohai: 已更换 %s 个风速配件编号", len(speed_retired))
             bridge = await original(self, states)
             if retired and self.aid_storage is not None:
                 changed = 0
@@ -307,6 +364,7 @@ async def _load_names(hass: HomeAssistant) -> None:
     names = data.get("names") if isinstance(data, dict) else None
     hass.data[_NAMES] = dict(names) if isinstance(names, dict) else {}
     hass.data[_AIDS_ROTATED] = bool(data.get("aids_rotated")) if isinstance(data, dict) else False
+    hass.data[_SPEED_ROTATED] = bool(data.get("speed_aids_rotated")) if isinstance(data, dict) else False
 
 
 async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
