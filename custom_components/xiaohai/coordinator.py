@@ -112,28 +112,43 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 _LOGGER.warning("产品版本风速：%s", " ".join(bits)[:500])
                 self._ver_noted = True
         if not self._dp_noted:
-            lines = []
+            noted = False
             for device in indexed.values():
                 spec = profile(device)
                 if not spec or spec.get("kind") != "climate" or not spec.get("fan"):
                     continue
                 dev = str(device.get("devId") or "")
-                dps = device.get("dps") or {}
+                dps = device.get("dps") if isinstance(device.get("dps"), dict) else {}
                 points = []
-                if isinstance(dps, dict):
-                    for key, value in dps.items():
-                        if isinstance(value, bool):
-                            points.append(f"{key}={'1' if value else '0'}")
-                        elif isinstance(value, int) and not isinstance(value, bool):
-                            points.append(f"{key}={value}")
-                        elif isinstance(value, str) and 0 < len(value) <= 16 and value.replace("_", "").isalnum():
-                            points.append(f"{key}={value}")
+                for key, value in dps.items():
+                    if isinstance(value, bool):
+                        points.append(f"{key}={'1' if value else '0'}")
+                    elif isinstance(value, int) and not isinstance(value, bool):
+                        points.append(f"{key}={value}")
+                    elif isinstance(value, str) and value:
+                        shown = value if len(value) <= 48 else f"len{len(value)}"
+                        if shown.replace("_", "").replace("-", "").isalnum():
+                            points.append(f"{key}={shown}")
                 schema = device.get("_schema") or {}
-                codes = ",".join(code for code in schema if isinstance(code, str) and not code.startswith("@"))
-                lines.append(f"{dev[-6:]}[{','.join(points)}] {codes}")
-            if lines:
-                _LOGGER.warning("空调数据点：%s", " | ".join(lines)[:1200])
-                self._dp_noted = True
+                codes = [
+                    f"{code}:{item.get('id')}"
+                    for code, item in schema.items()
+                    if isinstance(code, str)
+                    and not code.startswith("@")
+                    and isinstance(item, dict)
+                    and (
+                        int(item.get("id") or 0) >= 100
+                        or any(word in code for word in ("config", "fan", "speed", "wind", "gear"))
+                    )
+                ]
+                _LOGGER.warning(
+                    "空调数据点 %s %s | %s",
+                    dev[-6:],
+                    ",".join(points),
+                    ",".join(codes),
+                )
+                noted = True
+            self._dp_noted = noted
         if not self._speed_noted:
             missing = sorted(
                 {
