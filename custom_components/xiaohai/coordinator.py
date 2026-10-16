@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import device_id_from_unique_id, expand_speed_range, profile
+from .dp import device_id_from_unique_id, expand_speed_range, fan_range_text, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,31 +61,30 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 self._room_warned = True
             schemas.update(await self.client.async_product_schema(gid))
 
-        speed_notes: list[str] = []
-        for product_id, schema in schemas.items():
-            if not any(
+        speed_ids = [
+            product_id
+            for product_id, schema in schemas.items()
+            if any(
                 isinstance(key, str)
                 and not key.startswith("@")
                 and any(hint in key for hint in ("speed", "fan", "wind", "volume", "level"))
                 for key in schema
-            ):
-                continue
-            detail = await self.client.async_product_info(product_id)
-            expanded = expand_speed_range(schema, detail)
-            if not expanded:
-                own = next(
-                    (
-                        device.get("schema")
-                        for device in devices
-                        if str(device.get("productId") or "") == product_id and device.get("schema")
-                    ),
-                    None,
-                )
-                expanded = expand_speed_range(schema, own)
-            if expanded and not self._fan_noted:
+            )
+        ]
+        beans = await self.client.async_product_beans(speed_ids) if speed_ids else {}
+        speed_notes: list[str] = []
+        for product_id in speed_ids:
+            detail = beans.get(product_id)
+            expanded = expand_speed_range(schemas[product_id], detail)
+            if expanded:
                 speed_notes.append(f"{product_id}:{','.join(expanded)}")
-        if speed_notes and not self._fan_noted:
-            _LOGGER.warning("风速改用产品定义里的枚举：%s", " | ".join(speed_notes[:4]))
+            elif detail is not None:
+                speed_notes.append(f"{product_id}:range {fan_range_text(detail) or 'empty'}")
+        if not self._fan_noted and (speed_notes or self.client.last_schema_note):
+            note = " | ".join(speed_notes[:4])
+            if self.client.last_schema_note:
+                note = f"{note} {self.client.last_schema_note}".strip()
+            _LOGGER.warning("风速数据点：%s", note[:500])
             self._fan_noted = True
 
         indexed = {}

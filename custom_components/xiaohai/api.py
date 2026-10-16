@@ -186,19 +186,36 @@ class XiaohaiClient:
             return {}
         return schema_from_payload(result)
 
-    async def async_product_info(self, product_id: str) -> Any:
-        """Product definition, including the schema string the panel uses for enums."""
-        if product_id in self._product_info:
-            return self._product_info[product_id]
-        try:
-            result = await self._request("tuya.m.product.info.get", {"productId": product_id})
-        except XiaohaiError as err:
-            self._product_info[product_id] = None
-            self.last_schema_note = str(err)
-            return None
-        self._product_info[product_id] = result
-        self.last_schema_note = ""
-        return result
+    async def async_product_beans(self, product_ids: list[str]) -> dict[str, Any]:
+        """Product beans, including the schema string the panel uses for enums.
+
+        The app calls tuya.m.device.ref.info.list 5.4 with the product id list.
+        """
+        missing = [product_id for product_id in product_ids if product_id not in self._product_info]
+        if missing:
+            try:
+                result = await self._request(
+                    "tuya.m.device.ref.info.list",
+                    {"productIds": missing, "zigbeeGroup": True},
+                    version="5.4",
+                )
+            except XiaohaiError as err:
+                for product_id in missing:
+                    self._product_info[product_id] = None
+                self.last_schema_note = str(err)
+            else:
+                self.last_schema_note = ""
+                rows = result if isinstance(result, list) else []
+                by_id: dict[str, Any] = {}
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    product_id = str(item.get("id") or item.get("productId") or "")
+                    if product_id:
+                        by_id[product_id] = item
+                for product_id in missing:
+                    self._product_info[product_id] = by_id.get(product_id)
+        return {product_id: self._product_info.get(product_id) for product_id in product_ids}
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         """Publish datapoints through the Xiaohai cloud."""

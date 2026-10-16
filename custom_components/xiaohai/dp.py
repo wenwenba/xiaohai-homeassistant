@@ -529,6 +529,22 @@ def _schema_beans(payload: Any) -> list[dict]:
     return found
 
 
+def fan_range_text(payload: Any) -> str:
+    """Fan enum ranges from a product bean. Empty when the schema has none."""
+    notes: list[str] = []
+    for item in _schema_beans(payload):
+        enum_range = _enum_range(item)
+        if not enum_range:
+            continue
+        code = str(item.get("code") or item.get("id") or "")
+        if not any(hint in code for hint in ("speed", "fan", "wind", "volume", "level")) and not any(
+            str(token).startswith("level") for token in enum_range
+        ):
+            continue
+        notes.append(f"{code}={','.join(enum_range)}")
+    return " ".join(notes[:3])
+
+
 def expand_speed_range(schema: dict[str, str], payload: Any) -> list[str] | None:
     """Replace a short standard speed list with the longer device enum, when one exists.
 
