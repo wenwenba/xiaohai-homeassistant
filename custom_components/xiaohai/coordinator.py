@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import device_id_from_unique_id, expand_speed_range, fan_range_text, profile
+from .dp import device_id_from_unique_id, expand_speed_range, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,19 +77,10 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             if (ver := device.get("productVer") or device.get("productVersion"))
         }
         beans = await self.client.async_product_beans(speed_ids, versions) if speed_ids else {}
-        speed_notes: list[str] = []
         for product_id in speed_ids:
-            detail = beans.get(product_id)
-            expanded = expand_speed_range(schemas[product_id], detail)
-            if expanded:
-                speed_notes.append(f"{product_id}:{','.join(expanded)}")
-            elif detail is not None:
-                speed_notes.append(f"{product_id}:range {fan_range_text(detail) or 'empty'}")
-        if not self._fan_noted and (speed_notes or self.client.last_schema_note):
-            note = " | ".join(speed_notes[:4])
-            if self.client.last_schema_note:
-                note = f"{note} {self.client.last_schema_note}".strip()
-            _LOGGER.warning("风速数据点：%s", note[:500])
+            expand_speed_range(schemas[product_id], beans.get(product_id))
+        if not self._fan_noted and self.client.last_schema_note:
+            _LOGGER.warning("风速数据点没有取到：%s", self.client.last_schema_note[:300])
             self._fan_noted = True
 
         indexed = {}
