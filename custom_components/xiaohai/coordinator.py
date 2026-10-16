@@ -71,7 +71,12 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 for key in schema
             )
         ]
-        beans = await self.client.async_product_beans(speed_ids) if speed_ids else {}
+        versions = {
+            str(device.get("productId") or ""): str(ver)
+            for device in devices
+            if (ver := device.get("productVer") or device.get("productVersion"))
+        }
+        beans = await self.client.async_product_beans(speed_ids, versions) if speed_ids else {}
         speed_notes: list[str] = []
         for product_id in speed_ids:
             detail = beans.get(product_id)

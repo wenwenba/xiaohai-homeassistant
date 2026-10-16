@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
-from .dp import payload_shape, rooms_from_payload, schema_from_payload
+from .dp import fan_range_text, payload_shape, rooms_from_payload, schema_from_payload
 
 
 class XiaohaiError(Exception):
@@ -186,36 +186,66 @@ class XiaohaiClient:
             return {}
         return schema_from_payload(result)
 
-    async def async_product_beans(self, product_ids: list[str]) -> dict[str, Any]:
+    async def async_product_beans(
+        self,
+        product_ids: list[str],
+        versions: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Product beans, including the schema string the panel uses for enums.
 
-        The app calls tuya.m.device.ref.info.list 5.4 with the product id list.
+        The panel calls tuya.m.device.ref.info.list. Version 5.4 sends the id
+        list as JSON; this cloud rejects that and accepts the 6.1 string form
+        used for product id plus version, so both are tried.
         """
         missing = [product_id for product_id in product_ids if product_id not in self._product_info]
         if missing:
+            result, note = await self._product_bean_result(missing, versions or {})
+            self.last_schema_note = note
+            rows = result if isinstance(result, list) else []
+            by_id: dict[str, Any] = {}
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                product_id = str(item.get("id") or item.get("productId") or "")
+                if product_id:
+                    by_id[product_id] = item
+            for product_id in missing:
+                self._product_info[product_id] = by_id.get(product_id, result if len(missing) == 1 else None)
+        return {product_id: self._product_info.get(product_id) for product_id in product_ids}
+
+    async def _product_bean_result(
+        self,
+        product_ids: list[str],
+        versions: dict[str, str],
+    ) -> tuple[Any, str]:
+        id_text = json.dumps(product_ids, separators=(",", ":"))
+        ver_rows = [
+            {"pid": product_id, "ver": versions.get(product_id) or "1.0.0"}
+            for product_id in product_ids
+        ]
+        ver_text = json.dumps(ver_rows, separators=(",", ":"))
+        attempts = (
+            ("5.4", {"productIds": id_text, "zigbeeGroup": True}),
+            ("6.1", {"productIds": ver_text, "zigbeeGroup": True}),
+            ("5.4", {"productIds": id_text}),
+        )
+        notes: list[str] = []
+        for version, payload in attempts:
+            label = f"{version}:{','.join(payload)}"
             try:
                 result = await self._request(
                     "tuya.m.device.ref.info.list",
-                    {"productIds": missing, "zigbeeGroup": True},
-                    version="5.4",
+                    payload,
+                    version=version,
                 )
             except XiaohaiError as err:
-                for product_id in missing:
-                    self._product_info[product_id] = None
-                self.last_schema_note = str(err)
-            else:
-                self.last_schema_note = ""
-                rows = result if isinstance(result, list) else []
-                by_id: dict[str, Any] = {}
-                for item in rows:
-                    if not isinstance(item, dict):
-                        continue
-                    product_id = str(item.get("id") or item.get("productId") or "")
-                    if product_id:
-                        by_id[product_id] = item
-                for product_id in missing:
-                    self._product_info[product_id] = by_id.get(product_id)
-        return {product_id: self._product_info.get(product_id) for product_id in product_ids}
+                notes.append(f"{label} {err}")
+                continue
+            found = fan_range_text(result)
+            notes.append(f"{label} {found or 'no-range'}")
+            if found:
+                return result, " ".join(notes)
+        return None, " ".join(notes)
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         """Publish datapoints through the Xiaohai cloud."""
