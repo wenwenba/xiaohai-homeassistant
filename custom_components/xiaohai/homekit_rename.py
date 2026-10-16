@@ -8,13 +8,10 @@ current area plus its current name. The same bridge and accessory ids stay.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
-from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant, State, callback
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
-from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
@@ -98,15 +95,11 @@ def _make_name_writable(accessory: object, service: object) -> None:
         char = service.get_characteristic("Name")
     except ValueError:
         return
-    if getattr(char, "_xiaohai_name", False):
+    perms = list((getattr(char, "properties", None) or {}).get("Permissions") or [])
+    if "pw" not in perms:
+        char.override_properties({"Permissions": list(_PERMISSIONS)})
+    if getattr(char.setter_callback, "_xiaohai_name", False):
         return
-    char._xiaohai_name = True
-    try:
-        perms = list((getattr(char, "properties", None) or {}).get("Permissions") or [])
-        if "pw" not in perms:
-            char.override_properties({"Permissions": list(_PERMISSIONS)})
-    except Exception:
-        _LOGGER.debug("未能打开名称写入", exc_info=True)
     previous = char.setter_callback
 
     def _on_name(value: object, acc: object = accessory, prev=previous) -> None:
@@ -114,6 +107,7 @@ def _make_name_writable(accessory: object, service: object) -> None:
             prev(value)
         _remember_name(acc, value)
 
+    _on_name._xiaohai_name = True
     char.setter_callback = _on_name
 
 
@@ -147,7 +141,10 @@ def _install_patch() -> bool:
 
     def add_service(self: Accessory, *services: object) -> None:
         for service in services:
-            _attach_configured_name(self, service)
+            try:
+                _attach_configured_name(self, service)
+            except Exception:
+                _LOGGER.warning("xiaohai: 名称补丁跳过一个服务", exc_info=True)
         original(self, *services)
 
     add_service._xiaohai_configured_name = True
@@ -230,30 +227,8 @@ async def _load_names(hass: HomeAssistant) -> None:
     hass.data[_NAMES] = dict(names) if isinstance(names, dict) else {}
 
 
-async def _reload_bridges(hass: HomeAssistant) -> None:
-    loaded = []
-    for _ in range(90):
-        entries = hass.config_entries.async_entries("homekit")
-        if not entries:
-            _LOGGER.warning("xiaohai: 没有 HomeKit 桥，名称补丁已安装")
-            return
-        loaded = [entry for entry in entries if entry.state is ConfigEntryState.LOADED]
-        if loaded:
-            break
-        await asyncio.sleep(1)
-    else:
-        _LOGGER.warning("xiaohai: HomeKit 桥未就绪，名称补丁已安装")
-        return
-    for entry in loaded:
-        await hass.config_entries.async_reload(entry.entry_id)
-    _LOGGER.warning(
-        "xiaohai: HomeKit 桥已按原配件重载，名称可写，%s 个重名已按区域区分",
-        hass.data.get(_CHANGED, 0),
-    )
-
-
 async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
-    """Patch the running bridge once, then reload it in place."""
+    """Patch the bridge before it builds accessories. Do not reload it."""
     await _load_names(hass)
     if hass.data.get(_INSTALLED):
         return
@@ -261,10 +236,3 @@ async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
     _install_patch()
     _install_name_source()
     _LOGGER.warning("xiaohai: 名称补丁已安装")
-
-    @callback
-    def _later(_now: object) -> None:
-        hass.async_create_task(_reload_bridges(hass))
-
-    # A listener for the started event is missed when setup itself runs from that event.
-    async_call_later(hass, 1, _later)
