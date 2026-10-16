@@ -30,6 +30,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self._room_warned = False
         self._speed_noted = False
         self._fan_noted = False
+        self._ver_noted = False
         self._device_ids: tuple[str, ...] = ()
 
     async def _async_update_data(self) -> dict[str, dict]:
@@ -66,9 +67,9 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         seen: set[tuple[str, str]] = set()
         for device in devices:
             product_id = str(device.get("productId") or "")
-            if not product_id:
+            version = str(device.get("productVer") or device.get("productVersion") or "")
+            if not product_id or not version:
                 continue
-            version = str(device.get("productVer") or device.get("productVersion") or "1.0.0")
             device["_product_ver"] = version
             if (product_id, version) not in seen:
                 seen.add((product_id, version))
@@ -83,11 +84,32 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         for device in devices:
             product_id = str(device.get("productId") or "")
             schema = dict(schemas.get(product_id) or {})
-            version = str(device.get("_product_ver") or "1.0.0")
-            apply_panel_schema(schema, beans.get(f"{product_id}|{version}"))
+            version = str(device.get("_product_ver") or "")
+            if version:
+                apply_panel_schema(schema, beans.get(f"{product_id}|{version}"))
             device["_room"] = rooms.get(device["devId"])
             device["_schema"] = schema
             indexed[device["devId"]] = device
+        if not self._ver_noted:
+            bits = []
+            seen_ver: set[tuple[str, str, str]] = set()
+            for device in indexed.values():
+                schema = device.get("_schema") or {}
+                raw = str(schema.get("@range:fan_speed_enum") or "")
+                if not raw:
+                    continue
+                bit = (
+                    str(device.get("productId") or ""),
+                    str(device.get("_product_ver") or ""),
+                    raw,
+                )
+                if bit in seen_ver:
+                    continue
+                seen_ver.add(bit)
+                bits.append(f"{bit[0]}|{bit[1]}:{raw}")
+            if bits:
+                _LOGGER.warning("产品版本风速：%s", " ".join(bits)[:500])
+                self._ver_noted = True
         if not self._speed_noted:
             missing = sorted(
                 {

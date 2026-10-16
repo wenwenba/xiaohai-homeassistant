@@ -28,15 +28,53 @@ def _mobile_hash(data: str) -> str:
     return digest[8:16] + digest[0:8] + digest[24:32] + digest[16:24]
 
 
+def _text_version(node: dict) -> str:
+    for key in ("productVer", "productVersion"):
+        value = node.get(key)
+        if value:
+            return str(value)
+    for child_key in ("productInfo", "product", "meta"):
+        child = node.get(child_key)
+        if not isinstance(child, dict):
+            continue
+        for key in ("productVer", "productVersion"):
+            value = child.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
 def _version_map(payload: Any) -> dict[str, str]:
     found: dict[str, str] = {}
 
     def visit(node: Any) -> None:
         if isinstance(node, dict):
             dev_id = node.get("devId")
-            version = node.get("productVer") or node.get("productVersion")
+            version = _text_version(node)
             if dev_id and version:
-                found[str(dev_id)] = str(version)
+                found[str(dev_id)] = version
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(payload)
+    return found
+
+
+def _dev_key_names(payload: Any) -> str:
+    """Key names of one device object, for a failed version lookup."""
+    found = ""
+
+    def visit(node: Any) -> None:
+        nonlocal found
+        if found:
+            return
+        if isinstance(node, dict):
+            if node.get("devId"):
+                found = ",".join(sorted(str(key) for key in node)[:24])
+                return
             for value in node.values():
                 visit(value)
         elif isinstance(node, list):
@@ -88,7 +126,6 @@ class XiaohaiClient:
         self.last_schema_note = ""
         self._product_info: dict[str, Any] = {}
         self._versions: dict[str, str] = {}
-        self._version_sources: tuple[str, ...] | None = None
         self.last_version_note = ""
         self.devices: dict[str, dict[str, Any]] = {}
 
@@ -209,44 +246,38 @@ class XiaohaiClient:
         return schema_from_payload(result)
 
     async def async_attach_product_versions(self, devices: list[dict[str, Any]]) -> None:
-        """Copy each device's productVer from the list the app uses.
+        """Copy productVer from tuya.m.device.ext.prop.list.
 
-        The home list calls tuya.m.device.biz.prop.list, then the device bean
-        list tuya.m.device.ext.prop.list. The plain device list often omits
-        the version, which is what selects the datapoint range.
+        That is the device bean list the app uses. The plain device list omits
+        the version, and filling in 1.0.0 makes every unit share one schema.
         """
         gids = []
         for device in devices:
             gid = device.get("_group_id")
             if gid is not None and gid not in gids:
                 gids.append(gid)
-        if not gids or self._version_sources == ("none",):
-            self._apply_versions(devices)
-            return
-        sources = ("list21", "biz", "ext") if self._version_sources is None else self._version_sources
-        per_source: dict[str, dict[str, str]] = {}
-        errors: list[str] = []
-        for source in sources:
-            source_found: dict[str, str] = {}
-            for gid in gids:
-                try:
-                    payload = await self._version_payload(source, gid)
-                except XiaohaiError as err:
-                    errors.append(f"{source} {err}")
-                    continue
-                source_found.update(_version_map(payload))
-            if source_found:
-                per_source[source] = source_found
-        if self._version_sources is None:
-            varied = [name for name, mapping in per_source.items() if len(set(mapping.values())) > 1]
-            chosen = varied or list(per_source)
-            self._version_sources = tuple(chosen) if chosen else ("none",)
-            self.last_version_note = "" if chosen else " ".join(errors)[:300]
         found: dict[str, str] = {}
-        for source in self._version_sources:
-            found.update(per_source.get(source, {}))
+        errors: list[str] = []
+        key_note = ""
+        for gid in gids:
+            try:
+                payload = await self._request(
+                    "tuya.m.device.ext.prop.list",
+                    None,
+                    extra_params={"gid": str(gid)},
+                    version="1.0",
+                )
+            except XiaohaiError as err:
+                errors.append(str(err))
+                continue
+            found.update(_version_map(payload))
+            if not found and not key_note:
+                key_note = _dev_key_names(payload)
         if found:
             self._versions.update(found)
+            self.last_version_note = ""
+        elif not self._versions:
+            self.last_version_note = (" ".join(errors) or f"无产品版本 {key_note}")[:300]
         self._apply_versions(devices)
 
     def _apply_versions(self, devices: list[dict[str, Any]]) -> None:
@@ -254,28 +285,6 @@ class XiaohaiClient:
             version = self._versions.get(str(device.get("devId") or ""))
             if version:
                 device["productVer"] = version
-
-    async def _version_payload(self, source: str, gid: Any) -> Any:
-        gid_s = str(gid)
-        if source == "biz":
-            return await self._request(
-                "tuya.m.device.biz.prop.list",
-                {"gid": gid_s},
-                version="1.0",
-            )
-        if source == "ext":
-            return await self._request(
-                "tuya.m.device.ext.prop.list",
-                None,
-                extra_params={"gid": gid_s},
-                version="1.0",
-            )
-        return await self._request(
-            "tuya.m.my.group.device.list",
-            None,
-            extra_params={"gid": gid_s},
-            version="2.1",
-        )
 
     async def async_product_beans(self, pairs: list[tuple[str, str]]) -> dict[str, Any]:
         """Product beans for each product id and version.
@@ -304,19 +313,17 @@ class XiaohaiClient:
         else:
             self.last_schema_note = ""
             found: dict[str, Any] = {}
-            for item in result if isinstance(result, list) else []:
-                if not isinstance(item, dict):
-                    continue
+            rows = [item for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+            for item in rows:
                 product_id = str(item.get("id") or item.get("productId") or "")
-                version = str(item.get("productVer") or "")
-                if product_id:
+                version = str(item.get("productVer") or item.get("ver") or "")
+                if product_id and version:
                     found[f"{product_id}|{version}"] = item
             for product_id, version in pairs:
                 key = f"{product_id}|{version}"
                 bean = found.get(key)
-                if bean is None:
-                    same = [item for name, item in found.items() if name.startswith(f"{product_id}|")]
-                    bean = same[0] if len(same) == 1 else None
+                if bean is None and len(pairs) == 1 and len(rows) == 1:
+                    bean = rows[0]
                 if bean is not None:
                     self._product_info[key] = bean
         return {f"{product_id}|{version}": self._product_info.get(f"{product_id}|{version}") for product_id, version in pairs}
