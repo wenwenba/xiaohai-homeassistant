@@ -159,7 +159,7 @@ def _speed_code(schema: dict) -> str | None:
 def _reported_level_speed(device: dict) -> tuple[str, list[str]] | None:
     """Speed datapoint taken from a live level token when the schema omitted the enum.
 
-    A value of level1 uses the same spelling for level1, level2 and level3.
+    This panel reports level1. The app only has low and high, which are level1 and level2.
     level_1 is left to the cloud schema, which already lists that series.
     """
     dps = device.get("dps") or {}
@@ -171,7 +171,7 @@ def _reported_level_speed(device: dict) -> tuple[str, list[str]] | None:
         match = re.fullmatch(r"level(\d+)", value)
         if not match:
             continue
-        top = max(int(match.group(1)), 3)
+        top = max(int(match.group(1)), 2)
         return str(key), [f"level{index}" for index in range(1, top + 1)]
     return None
 
@@ -734,7 +734,7 @@ def _self_check() -> None:
     assert profile({"_schema": model})["kind"] == "fan"
     reported = profile({"_schema": {"switch": "1"}, "dps": {"1": False, "12": "level1", "9": 22}})
     assert reported["kind"] == "fan" and reported["power"] == "1" and reported["fan"] == "12"
-    assert reported["fan_values"] == ["level1", "level2", "level3"]
+    assert reported["fan_values"] == ["level1", "level2"]
 
 
 if __name__ == "__main__":
