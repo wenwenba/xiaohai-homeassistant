@@ -59,25 +59,26 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 _LOGGER.warning("房间关系没有解析出来：%s", self.client.last_room_note)
                 self._room_warned = True
             schemas.update(await self.client.async_product_schema(gid))
-        pending: list[str] = []
+        needs_speed = False
         for device in devices:
             product_id = str(device.get("productId") or "")
             schema = schemas.get(product_id) or {}
             if (
-                product_id
-                and product_id not in pending
-                and (schema.get("switch") or schema.get("switch_led"))
+                (schema.get("switch") or schema.get("switch_led"))
                 and not schema.get("temp_set")
                 and not schema.get("temp_current")
                 and _speed_code(schema) is None
             ):
-                pending.append(product_id)
-        for product_id in pending:
-            extra = await self.client.async_thing_model(product_id)
-            if extra:
-                merged = dict(schemas.get(product_id) or {})
-                merged.update(extra)
-                schemas[product_id] = merged
+                needs_speed = True
+                break
+        if needs_speed:
+            for gid in gids:
+                for product_id, extra in (await self.client.async_ref_specs(gid)).items():
+                    if product_id == "_" or not extra:
+                        continue
+                    merged = dict(schemas.get(product_id) or {})
+                    merged.update(extra)
+                    schemas[product_id] = merged
 
         indexed = {}
         for device in devices:
