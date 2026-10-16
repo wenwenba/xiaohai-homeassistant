@@ -246,10 +246,11 @@ class XiaohaiClient:
         return schema_from_payload(result)
 
     async def async_attach_product_versions(self, devices: list[dict[str, Any]]) -> None:
-        """Copy productVer from tuya.m.device.ext.prop.list.
+        """Copy productVer from the device bean the app stores.
 
-        That is the device bean list the app uses. The plain device list omits
-        the version, and filling in 1.0.0 makes every unit share one schema.
+        The batch prop list on this cloud has no product version. Each device
+        is then read with tuya.m.device.get 4.1, which returns that field.
+        1.0.0 is not filled in, because that version's fan range is five gears.
         """
         gids = []
         for device in devices:
@@ -273,6 +274,29 @@ class XiaohaiClient:
             found.update(_version_map(payload))
             if not found and not key_note:
                 key_note = _dev_key_names(payload)
+        for device in devices:
+            dev_id = str(device.get("devId") or "")
+            if not dev_id or dev_id in found:
+                continue
+            gid = device.get("_group_id")
+            extra = {"gid": str(gid)} if gid is not None else None
+            try:
+                payload = await self._request(
+                    "tuya.m.device.get",
+                    {"devId": dev_id},
+                    extra_params=extra,
+                    version="4.1",
+                )
+            except XiaohaiError as err:
+                errors.append(str(err))
+                break
+            version = _text_version(payload) if isinstance(payload, dict) else ""
+            if not version:
+                version = _version_map(payload).get(dev_id, "")
+            if version:
+                found[dev_id] = version
+            elif isinstance(payload, dict) and not key_note:
+                key_note = ",".join(sorted(str(key) for key in payload)[:24])
         if found:
             self._versions.update(found)
             self.last_version_note = ""
