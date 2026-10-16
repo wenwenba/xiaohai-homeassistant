@@ -31,6 +31,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self._speed_noted = False
         self._fan_noted = False
         self._ver_noted = False
+        self._dp_noted = False
         self._device_ids: tuple[str, ...] = ()
 
     async def _async_update_data(self) -> dict[str, dict]:
@@ -110,6 +111,29 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             if bits:
                 _LOGGER.warning("产品版本风速：%s", " ".join(bits)[:500])
                 self._ver_noted = True
+        if not self._dp_noted:
+            lines = []
+            for device in indexed.values():
+                spec = profile(device)
+                if not spec or spec.get("kind") != "climate" or not spec.get("fan"):
+                    continue
+                dev = str(device.get("devId") or "")
+                dps = device.get("dps") or {}
+                points = []
+                if isinstance(dps, dict):
+                    for key, value in dps.items():
+                        if isinstance(value, bool):
+                            points.append(f"{key}={'1' if value else '0'}")
+                        elif isinstance(value, int) and not isinstance(value, bool):
+                            points.append(f"{key}={value}")
+                        elif isinstance(value, str) and 0 < len(value) <= 16 and value.replace("_", "").isalnum():
+                            points.append(f"{key}={value}")
+                schema = device.get("_schema") or {}
+                codes = ",".join(code for code in schema if isinstance(code, str) and not code.startswith("@"))
+                lines.append(f"{dev[-6:]}[{','.join(points)}] {codes}")
+            if lines:
+                _LOGGER.warning("空调数据点：%s", " | ".join(lines)[:1200])
+                self._dp_noted = True
         if not self._speed_noted:
             missing = sorted(
                 {
