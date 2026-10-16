@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import device_id_from_unique_id, expand_speed_range, profile
+from .dp import apply_panel_schema, device_id_from_unique_id, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,22 +61,12 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 self._room_warned = True
             schemas.update(await self.client.async_product_schema(gid))
 
-        speed_ids = [
-            product_id
-            for product_id, schema in schemas.items()
-            if any(
-                isinstance(key, str)
-                and not key.startswith("@")
-                and any(hint in key for hint in ("speed", "fan", "wind", "volume", "level"))
-                for key in schema
-            )
-        ]
         await self.client.async_attach_product_versions(devices)
         pairs: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
         for device in devices:
             product_id = str(device.get("productId") or "")
-            if product_id not in speed_ids:
+            if not product_id:
                 continue
             version = str(device.get("productVer") or device.get("productVersion") or "1.0.0")
             device["_product_ver"] = version
@@ -86,7 +76,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         beans = await self.client.async_product_beans(pairs) if pairs else {}
         if not self._fan_noted and (self.client.last_schema_note or self.client.last_version_note):
             note = f"{self.client.last_version_note} {self.client.last_schema_note}".strip()
-            _LOGGER.warning("风速数据点没有取到：%s", note[:300])
+            _LOGGER.warning("功能点定义没有取到：%s", note[:300])
             self._fan_noted = True
 
         indexed = {}
@@ -94,7 +84,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             product_id = str(device.get("productId") or "")
             schema = dict(schemas.get(product_id) or {})
             version = str(device.get("_product_ver") or "1.0.0")
-            expand_speed_range(schema, beans.get(f"{product_id}|{version}"))
+            apply_panel_schema(schema, beans.get(f"{product_id}|{version}"))
             device["_room"] = rooms.get(device["devId"])
             device["_schema"] = schema
             indexed[device["devId"]] = device

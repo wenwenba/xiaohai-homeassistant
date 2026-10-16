@@ -529,30 +529,30 @@ def _schema_beans(payload: Any) -> list[dict]:
     return found
 
 
-def expand_speed_range(schema: dict[str, str], payload: Any) -> list[str] | None:
-    """Replace the standard speed list with the panel enum for this product version.
+def apply_panel_schema(schema: dict[str, str], payload: Any) -> None:
+    """Copy every datapoint range and limit from this product version.
 
-    The panel reads SchemaBean.property.range. A three-gear panel list replaces
-    a longer standard list, and a five-gear list replaces a shorter one.
+    The app does this for the whole device list. A shorter panel list replaces
+    a longer standard list, and a datapoint missing from the standard config is added.
     """
-    expanded: list[str] | None = None
     for item in _schema_beans(payload):
-        enum_range = _enum_range(item)
-        if not enum_range:
-            continue
         code = str(item.get("code") or "")
         dp = str(item.get("id")) if item.get("id") is not None else ""
-        for key, value in list(schema.items()):
-            if not isinstance(key, str) or key.startswith("@"):
-                continue
-            if value != dp and key != code:
-                continue
-            label = f"{key} {code}"
-            if not any(hint in label for hint in ("speed", "fan", "wind", "volume", "level")):
-                continue
-            schema[f"@range:{key}"] = json.dumps(enum_range, ensure_ascii=False)
-            expanded = enum_range
-    return expanded
+        keys = [
+            key
+            for key, value in schema.items()
+            if isinstance(key, str) and not key.startswith("@") and (value == dp or key == code)
+        ]
+        if not keys and code and dp:
+            schema[code] = dp
+            keys = [code]
+        enum_range = _enum_range(item)
+        limit = _number_limit(item)
+        for key in keys:
+            if enum_range:
+                schema[f"@range:{key}"] = json.dumps(enum_range, ensure_ascii=False)
+            if limit and any(value is not None for value in limit.values()):
+                schema[f"@limit:{key}"] = json.dumps(limit, ensure_ascii=False)
 
 
 def schema_from_payload(payload: Any) -> dict[str, dict[str, str]]:
@@ -834,16 +834,14 @@ def _self_check() -> None:
             )
         }
     }
-    assert expand_speed_range(five, product_schema) == [
-        "auto",
-        "level_1",
-        "level_2",
-        "level_3",
-        "level_4",
-        "level_5",
-    ]
+    apply_panel_schema(five, product_schema)
+    assert json.loads(five["@range:fan_speed_enum"])[-1] == "level_5"
     assert profile({"_schema": five})["fan_values"][-1] == "level_5"
     three = {
+        "mode": "4",
+        "@range:mode": "[\"auto\",\"cold\",\"hot\",\"wet\",\"wind\"]",
+        "temp_set": "2",
+        "@limit:temp_set": "{\"min\":16,\"max\":32}",
         "fan_speed_enum": "5",
         "@range:fan_speed_enum": "[\"auto\",\"level_1\",\"level_2\",\"level_3\"]",
     }
@@ -852,15 +850,45 @@ def _self_check() -> None:
             "schema": json.dumps(
                 [
                     {
+                        "id": "4",
+                        "code": "mode",
+                        "property": {"type": "enum", "range": ["cold", "hot", "wind"]},
+                    },
+                    {
+                        "id": "2",
+                        "code": "temp_set",
+                        "property": {"type": "value", "min": 11, "max": 35, "step": 1, "scale": 0},
+                    },
+                    {
                         "id": "5",
                         "code": "fan_speed_enum",
                         "property": {"type": "enum", "range": ["level_1", "level_2", "level_3"]},
+                    },
+                ]
+            )
+        }
+    }
+    fresh_schema = {
+        "schemaInfo": {
+            "schema": json.dumps(
+                [
+                    {
+                        "id": "12",
+                        "code": "fan_speed_enum",
+                        "property": {"type": "enum", "range": ["level1", "level2"]},
                     }
                 ]
             )
         }
     }
-    assert expand_speed_range(three, short_schema) == ["level_1", "level_2", "level_3"]
+    fresh = {"switch": "1"}
+    apply_panel_schema(three, short_schema)
+    apply_panel_schema(fresh, fresh_schema)
+    assert json.loads(three["@range:mode"]) == ["cold", "hot", "wind"]
+    assert json.loads(three["@limit:temp_set"])["min"] == 11
+    assert json.loads(three["@range:fan_speed_enum"]) == ["level_1", "level_2", "level_3"]
+    assert fresh["fan_speed_enum"] == "12"
+    assert json.loads(fresh["@range:fan_speed_enum"]) == ["level1", "level2"]
     assert panel_speeds("level1", ["level1", "level2", "level3"]) == ["level1", "level2"]
     assert panel_speeds("level_1", ["level_1", "level_2", "level_3"]) == ["level_1", "level_2", "level_3"]
 
