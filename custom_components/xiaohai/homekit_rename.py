@@ -12,9 +12,9 @@ import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
@@ -256,11 +256,11 @@ async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
     hass.data[_INSTALLED] = True
     _install_patch()
     _install_name_source()
+    _LOGGER.warning("xiaohai: 名称补丁已安装")
 
-    async def _apply(_event: object = None) -> None:
-        await _reload_bridges(hass)
+    @callback
+    def _schedule(_hass: HomeAssistant) -> None:
+        # After startup. Reloading while Home Assistant is still starting deadlocks the bridge.
+        hass.async_create_task(_reload_bridges(hass))
 
-    if hass.is_running:
-        hass.async_create_task(_apply())
-        return
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, lambda _event: hass.async_create_task(_apply()))
+    async_at_started(hass, _schedule)
