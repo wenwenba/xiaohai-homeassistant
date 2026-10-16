@@ -14,7 +14,7 @@ import logging
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
-from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
@@ -196,6 +196,10 @@ def _install_name_source() -> bool:
         async def _async_create_bridge_accessory(self, entity_states):
             try:
                 _assign_names(self.hass, list(entity_states), self._config)
+                _LOGGER.warning(
+                    "xiaohai: 桥配件已按可写名称创建，%s 个重名已按区域区分",
+                    self.hass.data.get(_CHANGED, 0),
+                )
             except Exception:
                 _LOGGER.warning("xiaohai: 区分 HomeKit 重名失败", exc_info=True)
             return await original(self, entity_states)
@@ -259,8 +263,8 @@ async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
     _LOGGER.warning("xiaohai: 名称补丁已安装")
 
     @callback
-    def _schedule(_hass: HomeAssistant) -> None:
-        # After startup. Reloading while Home Assistant is still starting deadlocks the bridge.
+    def _later(_now: object) -> None:
         hass.async_create_task(_reload_bridges(hass))
 
-    async_at_started(hass, _schedule)
+    # A listener for the started event is missed when setup itself runs from that event.
+    async_call_later(hass, 1, _later)
