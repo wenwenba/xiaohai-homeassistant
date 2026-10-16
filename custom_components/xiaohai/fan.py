@@ -54,8 +54,10 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
     def __init__(self, coordinator: XiaohaiCoordinator, dev_id: str) -> None:
         super().__init__(coordinator, dev_id)
         self._attr_unique_id = f"{dev_id}_fan"
-        if (profile(coordinator.data.get(dev_id) or {}) or {}).get("kind") == "climate":
-            self._attr_name = "风速"
+        device = coordinator.data.get(dev_id) or {}
+        if (profile(device) or {}).get("kind") == "climate":
+            self._attr_has_entity_name = False
+            self._attr_name = f"{device.get('name') or '空调'} 风速"
 
     @property
     def _spec(self) -> dict:
