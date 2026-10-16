@@ -21,6 +21,7 @@ _NAMES = "xiaohai_homekit_names"
 _ASSIGNED = "xiaohai_homekit_assigned"
 _CHANGED = "xiaohai_homekit_changed"
 _STORE = "xiaohai_homekit_name_store"
+_AIDS_ROTATED = "xiaohai_homekit_aids_rotated"
 _SKIP_SERVICES = {"HAPProtocolInformation"}
 _NAME_LIMIT = 64
 _PERMISSIONS = ["pr", "pw", "ev"]
@@ -56,6 +57,13 @@ def pick_names(
     return chosen, changed
 
 
+def _stored(hass: HomeAssistant) -> dict:
+    return {
+        "names": dict(hass.data.get(_NAMES) or {}),
+        "aids_rotated": bool(hass.data.get(_AIDS_ROTATED)),
+    }
+
+
 def _conflicts(chosen: dict[str, str], entity_id: str, name: str | None = None) -> bool:
     current = chosen[entity_id] if name is None else name
     return any(other != entity_id and value == current for other, value in chosen.items())
@@ -83,7 +91,7 @@ def _remember_name(accessory: object, value: object) -> None:
             names[entity_id] = name
             store: Store | None = hass.data.get(_STORE)
             if store is not None:
-                store.async_delay_save(lambda: {"names": dict(names)}, 1)
+                store.async_delay_save(lambda: _stored(hass), 1)
 
         hass.add_job(_store)
     except Exception:
@@ -181,6 +189,54 @@ def _assign_names(hass: HomeAssistant, states: list[State], config: dict) -> Non
     hass.data[_CHANGED] = changed
 
 
+async def _rotate_xiaohai_aids(
+    homekit: object, states: list[State]
+) -> tuple[dict[str, int], dict[str, int | None]]:
+    """Give bridged Xiaohai accessories a new aid, once.
+
+    The aid is a hash of the entity unique id, so deleting it would just
+    hand the same number back. The old number stays reserved and is never
+    given to another accessory. Pairing data and every other aid are left
+    alone. shortcut: tombstones are permanent, compact the aid store only if
+    it has to be rebuilt.
+    """
+    empty: tuple[dict[str, int], dict[str, int | None]] = ({}, {})
+    hass = homekit.hass
+    if hass.data.get(_AIDS_ROTATED):
+        return empty
+    storage = homekit.aid_storage
+    if storage is None:
+        return empty
+    registry = er.async_get(hass)
+    targets: list[str] = []
+    others: dict[str, int | None] = {}
+    for state in states:
+        entity = registry.async_get(state.entity_id)
+        if entity is not None and entity.platform == "xiaohai":
+            targets.append(state.entity_id)
+        else:
+            others[state.entity_id] = storage.get_allocated_aid_for_entity_id(state.entity_id)
+    if not targets:
+        return empty
+    retired: dict[str, int] = {}
+    for entity_id in targets:
+        old = storage.get_allocated_aid_for_entity_id(entity_id)
+        if old is None:
+            continue
+        storage.async_delete_aid_for_entity_id(entity_id)
+        storage.allocations[f"xiaohai.retired.{old}"] = old
+        storage.allocated_aids.add(old)
+        retired[entity_id] = old
+    if not retired:
+        return empty
+    hass.data[_AIDS_ROTATED] = True
+    store: Store | None = hass.data.get(_STORE)
+    if store is not None:
+        await store.async_save(_stored(hass))
+    await storage.async_save()
+    return retired, others
+
+
 def _install_name_source() -> bool:
     try:
         from homeassistant.components import homekit as hk
@@ -191,15 +247,40 @@ def _install_name_source() -> bool:
         original = hk.HomeKit._async_create_bridge_accessory
 
         async def _async_create_bridge_accessory(self, entity_states):
+            states = list(entity_states)
             try:
-                _assign_names(self.hass, list(entity_states), self._config)
+                _assign_names(self.hass, states, self._config)
                 _LOGGER.warning(
                     "xiaohai: 桥配件已按可写名称创建，%s 个重名已按区域区分",
                     self.hass.data.get(_CHANGED, 0),
                 )
             except Exception:
                 _LOGGER.warning("xiaohai: 区分 HomeKit 重名失败", exc_info=True)
-            return await original(self, entity_states)
+            retired: dict[str, int] = {}
+            others: dict[str, int | None] = {}
+            try:
+                retired, others = await _rotate_xiaohai_aids(self, states)
+            except Exception:
+                _LOGGER.warning("xiaohai: 更换配件编号失败", exc_info=True)
+            bridge = await original(self, states)
+            if retired and self.aid_storage is not None:
+                changed = 0
+                for entity_id, old in retired.items():
+                    new = self.aid_storage.get_allocated_aid_for_entity_id(entity_id)
+                    if new is not None and new != old:
+                        changed += 1
+                stable = 0
+                for entity_id, old in others.items():
+                    if self.aid_storage.get_allocated_aid_for_entity_id(entity_id) == old:
+                        stable += 1
+                _LOGGER.warning(
+                    "xiaohai: 已更换 %s 个小海配件编号，其余 %s 个编号未变",
+                    changed,
+                    stable,
+                )
+                if changed == len(retired):
+                    await self.aid_storage.async_save()
+            return bridge
 
         _async_create_bridge_accessory._xiaohai_names = True
         hk.HomeKit._async_create_bridge_accessory = _async_create_bridge_accessory
@@ -225,6 +306,7 @@ async def _load_names(hass: HomeAssistant) -> None:
     data = await store.async_load()
     names = data.get("names") if isinstance(data, dict) else None
     hass.data[_NAMES] = dict(names) if isinstance(names, dict) else {}
+    hass.data[_AIDS_ROTATED] = bool(data.get("aids_rotated")) if isinstance(data, dict) else False
 
 
 async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
