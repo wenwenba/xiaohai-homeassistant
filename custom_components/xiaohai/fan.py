@@ -17,7 +17,7 @@ from homeassistant.util.percentage import (
 from . import XiaohaiConfigEntry
 from .const import DOMAIN
 from .coordinator import XiaohaiCoordinator
-from .dp import dp_value, panel_speeds, profile
+from .dp import dp_value, profile, slider_speeds
 from .entity import XiaohaiEntity, take_new_entities
 
 
@@ -26,13 +26,13 @@ async def async_setup_entry(
     entry: XiaohaiConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Create a fan entity for each fresh-air unit."""
+    """Create a fan for each fresh-air unit and each air conditioner."""
     coordinator: XiaohaiCoordinator = hass.data[DOMAIN][entry.entry_id]
     known: set[str] = set()
 
     def _build(dev_id: str, device: dict) -> XiaohaiFan | None:
         spec = profile(device)
-        if not spec or spec["kind"] != "fan":
+        if not spec or spec["kind"] not in {"fan", "climate"} or not spec.get("fan"):
             return None
         return XiaohaiFan(coordinator, dev_id)
 
@@ -54,13 +54,15 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
     def __init__(self, coordinator: XiaohaiCoordinator, dev_id: str) -> None:
         super().__init__(coordinator, dev_id)
         self._attr_unique_id = f"{dev_id}_fan"
+        if (profile(coordinator.data.get(dev_id) or {}) or {}).get("kind") == "climate":
+            self._attr_name = "风速"
 
     @property
     def _spec(self) -> dict:
         return profile(self.device) or {}
 
     def _ordered(self) -> list[str]:
-        return panel_speeds(dp_value(self.device, self._spec.get("fan")), self._spec.get("fan_values"))
+        return slider_speeds(self.device)
 
     @property
     def supported_features(self) -> FanEntityFeature:
@@ -89,6 +91,8 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
         ordered = self._ordered()
         current = dp_value(self.device, self._spec.get("fan"))
         if not ordered or current is None or str(current) not in ordered:
+            if self._spec.get("kind") == "climate":
+                return None
             return None if self.is_on is None else 100
         return ordered_list_item_to_percentage(ordered, str(current))
 

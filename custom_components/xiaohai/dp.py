@@ -410,6 +410,23 @@ def apply_speed_mask(values: list[str], dps: Any) -> list[str]:
     return values if chosen is None else chosen
 
 
+def slider_speeds(device: dict) -> list[str]:
+    """Speeds for one fan slider.
+
+    Air conditioners use the same numbered gears as the climate entity.
+    auto stays on the climate entity, because a slider step cannot be named.
+    """
+    spec = profile(device)
+    if not spec or not spec.get("fan"):
+        return []
+    current = dp_value(device, spec.get("fan"))
+    if spec.get("kind") == "climate":
+        values = apply_speed_mask(list(spec.get("fan_values") or []), device.get("dps"))
+        speeds = speed_choices(current, values) or []
+        return [item for item in speeds if item != "auto"]
+    return panel_speeds(current, spec.get("fan_values"))
+
+
 def speed_choices(current: Any, values: list[str] | None = None) -> list[str] | None:
     """Fan speeds from the cloud enum. The current value is kept visible."""
     text = "" if current is None else str(current)
@@ -876,6 +893,24 @@ def _self_check() -> None:
     ]
     assert apply_speed_mask(speeds, {"5": "level_1", "107": five_mask}) == speeds
     assert apply_speed_mask(["level1", "level2"], {"101": "01"}) == ["level1", "level2"]
+    ac_schema = {
+        "switch": "1",
+        "temp_set": "2",
+        "fan_speed_enum": "5",
+        "@range:fan_speed_enum": "[\"level_1\",\"level_2\",\"level_3\",\"level_4\",\"level_5\",\"auto\"]",
+    }
+    assert slider_speeds({"_schema": ac_schema, "dps": {"5": "auto", "107": three_mask}}) == [
+        "level_1",
+        "level_3",
+        "level_5",
+    ]
+    assert slider_speeds({"_schema": ac_schema, "dps": {"5": "level_2", "107": five_mask}}) == [
+        "level_1",
+        "level_2",
+        "level_3",
+        "level_4",
+        "level_5",
+    ]
     three = {
         "mode": "4",
         "@range:mode": "[\"auto\",\"cold\",\"hot\",\"wet\",\"wind\"]",
