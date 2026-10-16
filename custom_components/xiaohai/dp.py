@@ -383,28 +383,29 @@ def panel_speeds(current: Any, values: list[str] | None = None) -> list[str]:
 
 
 def apply_speed_mask(values: list[str], dps: Any) -> list[str]:
-    """Drop fan speeds a per-device bitmask turns off.
+    """Drop numbered fan speeds a per-device bitmask turns off.
 
-    The product range lists every speed. Some units then store a longer digit
-    string whose first characters are 1 or 0 for those speeds, in the same order.
-    A string that is only as long as the list is left alone, so a short reading
-    cannot be mistaken for that mask.
+    The prefix lines up with level_1 through level_5. The next bit is 0 on
+    every unit, while the app still offers auto, so auto stays.
     """
     if not values or not isinstance(dps, dict):
+        return values
+    gears = [item for item in values if re.fullmatch(r"level_?\d+", item)]
+    if not gears:
         return values
     chosen: list[str] | None = None
     chosen_len = 0
     for value in dps.values():
-        if not isinstance(value, str) or not value.isdigit() or len(value) <= len(values):
+        if not isinstance(value, str) or not value.isdigit() or len(value) <= len(gears):
             continue
-        mask = value[: len(values)]
+        mask = value[: len(gears)]
         if set(mask) != {"0", "1"}:
             continue
-        picked = [item for item, bit in zip(values, mask) if bit == "1"]
-        if not picked or len(picked) == len(values):
+        enabled = {item for item, bit in zip(gears, mask) if bit == "1"}
+        if not enabled or len(enabled) == len(gears):
             continue
         if len(value) > chosen_len:
-            chosen = picked
+            chosen = [item for item in values if item not in gears or item in enabled]
             chosen_len = len(value)
     return values if chosen is None else chosen
 
@@ -871,14 +872,9 @@ def _self_check() -> None:
         "level_1",
         "level_3",
         "level_5",
+        "auto",
     ]
-    assert apply_speed_mask(speeds, {"5": "level_1", "107": five_mask}) == [
-        "level_1",
-        "level_2",
-        "level_3",
-        "level_4",
-        "level_5",
-    ]
+    assert apply_speed_mask(speeds, {"5": "level_1", "107": five_mask}) == speeds
     assert apply_speed_mask(["level1", "level2"], {"101": "01"}) == ["level1", "level2"]
     three = {
         "mode": "4",
