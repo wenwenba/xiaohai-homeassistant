@@ -141,11 +141,14 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                         or any(word in code for word in ("config", "fan", "speed", "wind", "gear"))
                     )
                 ]
+                prop = await self.client.async_panel_property(device)
                 _LOGGER.warning(
-                    "空调数据点 %s %s | %s",
+                    "空调数据点 %s %s | %s | %s | %s",
                     dev[-6:],
                     ",".join(points),
                     ",".join(codes),
+                    prop,
+                    self.client.last_get_keys,
                 )
                 noted = True
             self._dp_noted = noted

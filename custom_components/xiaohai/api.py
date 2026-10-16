@@ -28,6 +28,41 @@ def _mobile_hash(data: str) -> str:
     return digest[8:16] + digest[0:8] + digest[24:32] + digest[16:24]
 
 
+def _short_property(payload: Any) -> str:
+    """Key names and short values. Skips anything that could be a secret."""
+
+    def pair(key: str, value: Any) -> str:
+        lowered = key.lower()
+        if any(word in lowered for word in ("key", "token", "secret", "local", "pass", "pwd")):
+            return ""
+        if isinstance(value, bool):
+            return f"{key}={'1' if value else '0'}"
+        if isinstance(value, int) and not isinstance(value, bool):
+            return f"{key}={value}"
+        if isinstance(value, str) and 0 < len(value) <= 32 and value.replace("_", "").replace("-", "").isalnum():
+            return f"{key}={value}"
+        if isinstance(value, dict):
+            return f"{key}:{'/'.join(map(str, list(value)[:6]))}"
+        if isinstance(value, list):
+            return f"{key}[{len(value)}]"
+        return key
+
+    if isinstance(payload, list):
+        bits = []
+        for item in payload[:12]:
+            if not isinstance(item, dict):
+                bits.append(type(item).__name__)
+                continue
+            code = str(item.get("code") or item.get("k") or "")
+            value = item.get("value") if "value" in item else item.get("v")
+            bits.append(pair(code, value) if code else ",".join(map(str, list(item)[:4])))
+        return " ".join(bit for bit in bits if bit)[:240]
+    if isinstance(payload, dict):
+        bits = [pair(str(key), value) for key, value in list(payload.items())[:16]]
+        return ",".join(bit for bit in bits if bit)[:240]
+    return type(payload).__name__
+
+
 def _text_version(node: dict) -> str:
     for key in ("productVer", "productVersion"):
         value = node.get(key)
@@ -127,6 +162,9 @@ class XiaohaiClient:
         self._product_info: dict[str, Any] = {}
         self._versions: dict[str, str] = {}
         self.last_version_note = ""
+        self.last_get_keys = ""
+        self._property_action = ""
+        self._property_failed = False
         self.devices: dict[str, dict[str, Any]] = {}
 
     @property
@@ -297,6 +335,16 @@ class XiaohaiClient:
                 found[dev_id] = version
             elif isinstance(payload, dict) and not key_note:
                 key_note = ",".join(sorted(str(key) for key in payload)[:24])
+            if isinstance(payload, dict) and not self.last_get_keys:
+                parts = []
+                for key, value in list(payload.items())[:24]:
+                    if isinstance(value, dict):
+                        parts.append(f"{key}:{'/'.join(map(str, list(value)[:6]))}")
+                    elif isinstance(value, list):
+                        parts.append(f"{key}[{len(value)}]")
+                    else:
+                        parts.append(str(key))
+                self.last_get_keys = ",".join(parts)[:300]
         if found:
             self._versions.update(found)
             self.last_version_note = ""
@@ -351,6 +399,37 @@ class XiaohaiClient:
                 if bean is not None:
                     self._product_info[key] = bean
         return {f"{product_id}|{version}": self._product_info.get(f"{product_id}|{version}") for product_id, version in pairs}
+
+    async def async_panel_property(self, device: dict[str, Any]) -> str:
+        """Short panel-property values for one device.
+
+        The panel reads s.m.dev.property.get with the gateway id and device id.
+        Names that this cloud rejects are not retried on the remaining devices.
+        """
+        if self._property_failed:
+            return ""
+        dev_id = str(device.get("devId") or "")
+        gateway = str(device.get("meshId") or device.get("parentId") or dev_id)
+        actions = (self._property_action,) if self._property_action else (
+            "s.m.dev.property.get",
+            "tuya.s.m.dev.property.get",
+            "tuya.m.dev.property.get",
+        )
+        error = ""
+        for action in actions:
+            try:
+                payload = await self._request(
+                    action,
+                    {"gwId": gateway, "devId": dev_id},
+                    version="1.0",
+                )
+            except XiaohaiError as err:
+                error = str(err)
+                continue
+            self._property_action = action
+            return _short_property(payload)
+        self._property_failed = True
+        return error[:160]
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         """Publish datapoints through the Xiaohai cloud."""
