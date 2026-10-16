@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import device_id_from_unique_id, expand_speed_range, profile, speed_enum_note
+from .dp import device_id_from_unique_id, expand_speed_range, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,29 +82,10 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                     None,
                 )
                 expanded = expand_speed_range(schema, own)
-            if expanded:
+            if expanded and not self._fan_noted:
                 speed_notes.append(f"{product_id}:{','.join(expanded)}")
-        if not self._fan_noted and gids:
-            for product_id, raw in await self.client.async_listed_schema(gids[0]):
-                schema = schemas.get(product_id)
-                if not schema:
-                    continue
-                expanded = expand_speed_range(schema, raw)
-                if expanded:
-                    speed_notes.append(f"{product_id}:{','.join(expanded)}")
-        if not self._fan_noted:
-            lines = list(speed_notes)
-            if self.client.last_schema_note:
-                lines.append(self.client.last_schema_note)
-            for product_id in list(schemas)[:3]:
-                detail = self.client._product_info.get(product_id)
-                if isinstance(detail, dict):
-                    lines.append(
-                        f"{product_id} keys={','.join(sorted(detail)[:8])} {speed_enum_note(detail) or 'no-enum'}"
-                    )
-                else:
-                    lines.append(f"{product_id} info={detail!s:.80}")
-            _LOGGER.warning("风速排查：%s", " | ".join(lines)[:700])
+        if speed_notes and not self._fan_noted:
+            _LOGGER.warning("风速改用产品定义里的枚举：%s", " | ".join(speed_notes[:4]))
             self._fan_noted = True
 
         indexed = {}
