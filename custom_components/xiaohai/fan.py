@@ -75,6 +75,10 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
         return len(self._ordered()) or 1
 
     @property
+    def percentage_step(self) -> float:
+        return 100 / self.speed_count
+
+    @property
     def is_on(self) -> bool | None:
         power = dp_value(self.device, self._spec.get("power"))
         return None if power is None else bool(power)

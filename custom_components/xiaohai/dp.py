@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 MODE_TO_HVAC = {
@@ -155,6 +156,26 @@ def _speed_code(schema: dict) -> str | None:
     return None
 
 
+def _reported_level_speed(device: dict) -> tuple[str, list[str]] | None:
+    """Speed datapoint taken from a live level token when the schema omitted the enum.
+
+    A value of level1 uses the same spelling for level1, level2 and level3.
+    level_1 is left to the cloud schema, which already lists that series.
+    """
+    dps = device.get("dps") or {}
+    if not isinstance(dps, dict):
+        return None
+    for key, value in dps.items():
+        if not isinstance(value, str):
+            continue
+        match = re.fullmatch(r"level(\d+)", value)
+        if not match:
+            continue
+        top = max(int(match.group(1)), 3)
+        return str(key), [f"level{index}" for index in range(1, top + 1)]
+    return None
+
+
 def profile(device: dict) -> dict | None:
     """How to control this device, using only the cloud schema."""
     schema = device.get("_schema") or {}
@@ -163,6 +184,9 @@ def profile(device: dict) -> dict | None:
     mode = _code_dp(schema, "mode")
     speed = _speed_code(schema)
     fan = schema.get(speed) if speed else None
+    reported = None if fan else _reported_level_speed(device)
+    if reported:
+        fan = reported[0]
     if target or current:
         kind = "climate"
     elif fan or _code_dp(schema, "switch", "switch_led"):
@@ -179,7 +203,7 @@ def profile(device: dict) -> dict | None:
         "mode": mode,
         "mode_values": _code_range(schema, "mode"),
         "fan": fan,
-        "fan_values": _code_range(schema, speed) if speed else None,
+        "fan_values": _code_range(schema, speed) if speed else (reported[1] if reported else None),
         "target_min": limit.get("min"),
         "target_max": limit.get("max"),
         "target_step": limit.get("step"),
@@ -708,6 +732,9 @@ def _self_check() -> None:
     assert model["switch"] == "1" and model["fan_speed_enum"] == "12"
     assert json.loads(model["@range:fan_speed_enum"]) == ["level1", "level2", "level3"]
     assert profile({"_schema": model})["kind"] == "fan"
+    reported = profile({"_schema": {"switch": "1"}, "dps": {"1": False, "12": "level1", "9": 22}})
+    assert reported["kind"] == "fan" and reported["power"] == "1" and reported["fan"] == "12"
+    assert reported["fan_values"] == ["level1", "level2", "level3"]
 
 
 if __name__ == "__main__":
