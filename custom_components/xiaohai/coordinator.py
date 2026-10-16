@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import device_id_from_unique_id
+from .dp import device_id_from_unique_id, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         )
         self.client = client
         self._room_warned = False
+        self._speed_noted = False
         self._device_ids: tuple[str, ...] = ()
 
     async def _async_update_data(self) -> dict[str, dict]:
@@ -64,6 +65,22 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             device["_room"] = rooms.get(device["devId"])
             device["_schema"] = schemas.get(str(device.get("productId") or "")) or {}
             indexed[device["devId"]] = device
+        if not self._speed_noted:
+            missing = sorted(
+                {
+                    f"{device.get('productId')}:{'、'.join(code for code in sorted(schema) if not str(code).startswith('@'))}"
+                    for device in indexed.values()
+                    for schema in [device.get("_schema") or {}]
+                    if schema
+                    and (
+                        (spec := profile(device)) is None
+                        or (spec.get("kind") == "fan" and not spec.get("fan"))
+                    )
+                }
+            )
+            if missing:
+                _LOGGER.warning("云端有功能码但没有风速：%s", " | ".join(missing[:6]))
+            self._speed_noted = True
         ids = tuple(sorted(indexed))
         if ids != self._device_ids:
             _LOGGER.info("已从云端获取 %s 台设备", len(ids))

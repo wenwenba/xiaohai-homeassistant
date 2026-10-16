@@ -1,10 +1,18 @@
-"""Fresh air."""
+"""Fresh air. One fan: on/off plus a speed slider.
+
+HomeKit turns each preset into its own switch, so the cloud speeds are
+steps on a single slider instead.
+"""
 
 from __future__ import annotations
 
 from homeassistant.components.fan import FanEntity, FanEntityFeature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util.percentage import (
+    ordered_list_item_to_percentage,
+    percentage_to_ordered_list_item,
+)
 
 from . import XiaohaiConfigEntry
 from .const import DOMAIN
@@ -38,7 +46,7 @@ async def async_setup_entry(
 
 
 class XiaohaiFan(XiaohaiEntity, FanEntity):
-    """One fresh-air unit. Speed is the cloud enum, for example level1."""
+    """One fresh-air unit."""
 
     _attr_name = None
     _attr_icon = "mdi:fan"
@@ -51,12 +59,20 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
     def _spec(self) -> dict:
         return profile(self.device) or {}
 
+    def _ordered(self) -> list[str]:
+        choices = speed_choices(dp_value(self.device, self._spec.get("fan")), self._spec.get("fan_values")) or []
+        return [choice for choice in choices if choice not in {"off", "close"}]
+
     @property
     def supported_features(self) -> FanEntityFeature:
         features = FanEntityFeature.TURN_ON | FanEntityFeature.TURN_OFF
-        if self._spec.get("fan"):
-            features |= FanEntityFeature.PRESET_MODE
+        if self._ordered():
+            features |= FanEntityFeature.SET_SPEED
         return features
+
+    @property
+    def speed_count(self) -> int:
+        return len(self._ordered()) or 1
 
     @property
     def is_on(self) -> bool | None:
@@ -64,29 +80,37 @@ class XiaohaiFan(XiaohaiEntity, FanEntity):
         return None if power is None else bool(power)
 
     @property
-    def preset_mode(self) -> str | None:
-        value = dp_value(self.device, self._spec.get("fan"))
-        return None if value is None else str(value)
+    def percentage(self) -> int | None:
+        if self.is_on is False:
+            return 0
+        ordered = self._ordered()
+        current = dp_value(self.device, self._spec.get("fan"))
+        if not ordered or current is None or str(current) not in ordered:
+            return None if self.is_on is None else 100
+        return ordered_list_item_to_percentage(ordered, str(current))
 
-    @property
-    def preset_modes(self) -> list[str] | None:
-        if not self._spec.get("fan"):
-            return None
-        return speed_choices(dp_value(self.device, self._spec.get("fan")), self._spec.get("fan_values"))
-
-    async def async_set_preset_mode(self, preset_mode: str) -> None:
+    async def async_set_percentage(self, percentage: int) -> None:
+        if percentage == 0:
+            await self.async_turn_off()
+            return
+        ordered = self._ordered()
+        power = self._spec.get("power")
         fan = self._spec.get("fan")
-        if fan:
-            await self.async_publish({fan: preset_mode})
+        dps: dict = {}
+        if power:
+            dps[power] = True
+        if ordered and fan:
+            dps[fan] = percentage_to_ordered_list_item(ordered, percentage)
+        if dps:
+            await self.async_publish(dps)
 
     async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs) -> None:
-        power = self._spec.get("power")
-        if not power:
+        if percentage:
+            await self.async_set_percentage(percentage)
             return
-        dps: dict = {power: True}
-        if preset_mode and self._spec.get("fan"):
-            dps[self._spec["fan"]] = preset_mode
-        await self.async_publish(dps)
+        power = self._spec.get("power")
+        if power:
+            await self.async_publish({power: True})
 
     async def async_turn_off(self, **kwargs) -> None:
         power = self._spec.get("power")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -40,6 +41,7 @@ class XiaohaiOnlineSensor(XiaohaiEntity, BinarySensorEntity):
 
     _attr_name = "在线"
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: XiaohaiCoordinator, dev_id: str) -> None:
         super().__init__(coordinator, dev_id)

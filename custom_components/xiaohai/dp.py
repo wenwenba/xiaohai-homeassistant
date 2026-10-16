@@ -117,16 +117,55 @@ def hvac_names(mode_values: list[str] | None) -> list[str]:
     return names
 
 
+_SPEED_CODES = (
+    "fan_speed_enum",
+    "fan_speed",
+    "speed",
+    "supply_fan_speed",
+    "exhaust_fan_speed",
+    "air_volume",
+)
+
+
+def _enum_codes(schema: dict) -> list[str]:
+    codes: list[str] = []
+    for key in schema:
+        if isinstance(key, str) and key.startswith("@range:"):
+            code = key[len("@range:") :]
+            if schema.get(code) and code not in codes:
+                codes.append(code)
+    return codes
+
+
+def _speed_code(schema: dict) -> str | None:
+    """Cloud code that carries this device's fan speeds."""
+    for code in _SPEED_CODES:
+        if schema.get(code):
+            return code
+    for code in _enum_codes(schema):
+        if any(hint in code for hint in ("speed", "fan", "wind", "volume", "level")):
+            return code
+    others = [
+        code
+        for code in _enum_codes(schema)
+        if code not in {"mode", "mode_dry", "sleep", "loop_mode", "countdown_set", "purify_mode"}
+    ]
+    if len(others) == 1:
+        return others[0]
+    return None
+
+
 def profile(device: dict) -> dict | None:
     """How to control this device, using only the cloud schema."""
     schema = device.get("_schema") or {}
     target = _code_dp(schema, "temp_set", "temp_set_c")
     current = _code_dp(schema, "temp_current", "temp_current_c")
     mode = _code_dp(schema, "mode")
-    fan = _code_dp(schema, "fan_speed_enum", "fan_speed", "speed")
-    if target or current or mode:
+    speed = _speed_code(schema)
+    fan = schema.get(speed) if speed else None
+    if target or current:
         kind = "climate"
-    elif fan:
+    elif fan or _code_dp(schema, "switch", "switch_led"):
         kind = "fan"
     else:
         return None
@@ -140,7 +179,7 @@ def profile(device: dict) -> dict | None:
         "mode": mode,
         "mode_values": _code_range(schema, "mode"),
         "fan": fan,
-        "fan_values": _code_range(schema, "fan_speed_enum", "fan_speed", "speed"),
+        "fan_values": _code_range(schema, speed) if speed else None,
         "target_min": limit.get("min"),
         "target_max": limit.get("max"),
         "target_step": limit.get("step"),
@@ -592,6 +631,36 @@ def _self_check() -> None:
     assert cloud_mode_token(live["mode_values"], "cool") == "cold"
     assert hvac_names(live["mode_values"]) == ["cool", "heat", "fan_only", "auto", "dry"]
     assert cloud_mode_token(["level1"], "cool") is None
+    fresh = schema_from_payload(
+        [{
+            "productId": "kcmvsgmz",
+            "functionSchemaList": [
+                {"standardCode": "switch", "relationDpIdMaps": {"switch": 1}},
+                {
+                    "standardCode": "supply_fan_speed",
+                    "valueRange": "{\"range\":[\"low\",\"mid\",\"high\"]}",
+                    "relationDpIdMaps": {"supply_fan_speed": 12},
+                },
+            ],
+        }]
+    )
+    fresh_spec = profile({"_schema": fresh["kcmvsgmz"]})
+    assert fresh_spec["kind"] == "fan" and fresh_spec["power"] == "1" and fresh_spec["fan"] == "12"
+    assert fresh_spec["fan_values"] == ["low", "mid", "high"]
+    named = schema_from_payload(
+        [{
+            "productId": "kcmvsgmz",
+            "functionSchemaList": [
+                {"standardCode": "switch", "relationDpIdMaps": {"switch": 1}},
+                {
+                    "standardCode": "wind_level",
+                    "valueRange": "{\"range\":[\"level1\",\"level2\",\"level3\"]}",
+                    "relationDpIdMaps": {"wind_level": 12},
+                },
+            ],
+        }]
+    )
+    assert profile({"_schema": named["kcmvsgmz"]})["fan"] == "12"
 
 
 if __name__ == "__main__":
