@@ -200,6 +200,35 @@ class XiaohaiClient:
         self.last_schema_note = ""
         return result
 
+    async def async_listed_schema(self, gid: Any) -> list[tuple[str, str]]:
+        """Schema strings from a newer device-list version, when that version has them."""
+        found: list[tuple[str, str]] = []
+        notes: list[str] = []
+        for version in ("2.0", "2.1", "2.2"):
+            try:
+                listed = await self._request(
+                    "tuya.m.my.group.device.list",
+                    None,
+                    extra_params={"gid": str(gid)},
+                    version=version,
+                )
+            except XiaohaiError as err:
+                notes.append(f"{version}:{err}")
+                continue
+            if isinstance(listed, dict):
+                listed = listed.get("devices") or listed.get("list") or []
+            schemas = [
+                (str(device.get("productId") or ""), device.get("schema"))
+                for device in listed or []
+                if isinstance(device, dict) and isinstance(device.get("schema"), str)
+            ]
+            notes.append(f"{version}:schema={len(schemas)}")
+            found.extend((product_id, schema) for product_id, schema in schemas if product_id)
+            if schemas:
+                break
+        self.last_schema_note = " ".join(notes)
+        return found
+
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         """Publish datapoints through the Xiaohai cloud."""
         dev_id = device["devId"]

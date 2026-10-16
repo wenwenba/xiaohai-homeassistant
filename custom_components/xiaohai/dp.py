@@ -522,8 +522,29 @@ def _schema_beans(payload: Any) -> list[dict]:
             for value in node:
                 visit(value)
 
+    if isinstance(payload, str):
+        take(payload)
+        return found
     visit(payload)
     return found
+
+
+def speed_enum_note(payload: Any) -> str:
+    """Short list of enum ranges. No device identifiers."""
+    notes: list[str] = []
+    for item in _schema_beans(payload):
+        enum_range = _enum_range(item)
+        if not enum_range:
+            continue
+        code = str(item.get("code") or item.get("id") or "")
+        if not any(hint in code for hint in ("speed", "fan", "wind", "volume", "level")) and not any(
+            token.startswith("level") for token in enum_range
+        ):
+            continue
+        notes.append(f"{code}={','.join(enum_range)}")
+        if len(notes) >= 4:
+            break
+    return " ".join(notes)
 
 
 def expand_speed_range(schema: dict[str, str], payload: Any) -> list[str] | None:
