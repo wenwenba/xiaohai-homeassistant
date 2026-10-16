@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import device_id_from_unique_id, profile
+from .dp import _speed_code, device_id_from_unique_id, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +59,25 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 _LOGGER.warning("房间关系没有解析出来：%s", self.client.last_room_note)
                 self._room_warned = True
             schemas.update(await self.client.async_product_schema(gid))
+        pending: list[str] = []
+        for device in devices:
+            product_id = str(device.get("productId") or "")
+            schema = schemas.get(product_id) or {}
+            if (
+                product_id
+                and product_id not in pending
+                and (schema.get("switch") or schema.get("switch_led"))
+                and not schema.get("temp_set")
+                and not schema.get("temp_current")
+                and _speed_code(schema) is None
+            ):
+                pending.append(product_id)
+        for product_id in pending:
+            extra = await self.client.async_thing_model(product_id)
+            if extra:
+                merged = dict(schemas.get(product_id) or {})
+                merged.update(extra)
+                schemas[product_id] = merged
 
         indexed = {}
         for device in devices:
@@ -79,7 +98,30 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 }
             )
             if missing:
-                _LOGGER.warning("云端有功能码但没有风速：%s", " | ".join(missing[:6]))
+                samples: list[str] = []
+                for device in indexed.values():
+                    product_id = str(device.get("productId") or "")
+                    if not any(item.startswith(f"{product_id}:") for item in missing):
+                        continue
+                    dps = device.get("dps") or {}
+                    if not isinstance(dps, dict):
+                        continue
+                    bits = []
+                    for key, value in list(dps.items())[:10]:
+                        if isinstance(value, bool):
+                            bits.append(f"{key}={'true' if value else 'false'}")
+                        elif isinstance(value, (int, str)) and not isinstance(value, bool) and len(str(value)) < 24:
+                            bits.append(f"{key}={value}")
+                    if bits:
+                        samples.append(f"{product_id}[{','.join(bits)}]")
+                    if len(samples) >= 2:
+                        break
+                _LOGGER.warning(
+                    "云端有功能码但没有风速：%s %s %s",
+                    " | ".join(missing[:6]),
+                    " ".join(samples),
+                    self.client.last_thing_note,
+                )
             self._speed_noted = True
         ids = tuple(sorted(indexed))
         if ids != self._device_ids:

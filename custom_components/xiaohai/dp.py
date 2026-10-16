@@ -320,7 +320,7 @@ def _relation_map(item: dict) -> dict | None:
 
 
 def _item_dp(item: dict, code: str | None) -> str | None:
-    for key in ("dpId", "dp_id"):
+    for key in ("dpId", "dp_id", "abilityId"):
         if _is_dp_id(item.get(key)):
             return _as_dp_id(item[key])
     if _is_dp_id(item.get("id")):
@@ -495,6 +495,30 @@ def schema_from_payload(payload: Any) -> dict[str, dict[str, str]]:
     return found
 
 
+def thing_schema(payload: Any) -> dict[str, str]:
+    """Datapoint codes from a product thing model, including enum ranges."""
+    codes: dict[str, str] = {}
+
+    def visit(node: dict) -> None:
+        if not any(key in node for key in ("typeSpec", "valueRange", "abilityId", "values", "property")):
+            return
+        names = _item_codes(node)
+        dp = _item_dp(node, names[0] if names else None)
+        if not names or dp is None:
+            return
+        enum_range = _device_tokens(_enum_range(node), node.get("strategyValue")) or _enum_range(node)
+        limit = _number_limit(node)
+        for code in names:
+            codes[code] = dp
+            if enum_range:
+                codes[f"@range:{code}"] = json.dumps(enum_range, ensure_ascii=False)
+            if limit and any(value is not None for value in limit.values()):
+                codes[f"@limit:{code}"] = json.dumps(limit, ensure_ascii=False)
+
+    _walk(payload, visit)
+    return codes
+
+
 def _self_check() -> None:
     assert device_online({"moduleMap": {"zigbee": {"isOnline": True}}}) is True
     assert device_online({"moduleMap": {"zigbee": {"isOnline": False}}}) is False
@@ -661,6 +685,29 @@ def _self_check() -> None:
         }]
     )
     assert profile({"_schema": named["kcmvsgmz"]})["fan"] == "12"
+    model = thing_schema(
+        {
+            "model": json.dumps(
+                {
+                    "services": [
+                        {
+                            "properties": [
+                                {"code": "switch", "abilityId": 1, "typeSpec": {"type": "bool"}},
+                                {
+                                    "code": "fan_speed_enum",
+                                    "abilityId": 12,
+                                    "typeSpec": {"type": "enum", "range": ["level1", "level2", "level3"]},
+                                },
+                            ]
+                        }
+                    ]
+                }
+            )
+        }
+    )
+    assert model["switch"] == "1" and model["fan_speed_enum"] == "12"
+    assert json.loads(model["@range:fan_speed_enum"]) == ["level1", "level2", "level3"]
+    assert profile({"_schema": model})["kind"] == "fan"
 
 
 if __name__ == "__main__":

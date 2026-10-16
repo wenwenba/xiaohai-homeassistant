@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
-from .dp import payload_shape, rooms_from_payload, schema_from_payload
+from .dp import payload_shape, rooms_from_payload, schema_from_payload, thing_schema
 
 
 class XiaohaiError(Exception):
@@ -66,6 +66,8 @@ class XiaohaiClient:
         self._country_code = country_code.strip() or "86"
         self._sid: str | None = None
         self.last_room_note = ""
+        self.last_thing_note = ""
+        self._thing_cache: dict[str, dict[str, str]] = {}
         self.devices: dict[str, dict[str, Any]] = {}
 
     @property
@@ -183,6 +185,35 @@ class XiaohaiClient:
         except XiaohaiError:
             return {}
         return schema_from_payload(result)
+
+    async def async_thing_model(self, product_id: str) -> dict[str, str]:
+        """Datapoints the standard config left out, from the product thing model."""
+        if product_id in self._thing_cache:
+            return self._thing_cache[product_id]
+        last = ""
+        attempts: tuple[tuple[dict[str, Any] | None, dict[str, str] | None], ...] = (
+            ({"productId": product_id}, None),
+            (None, {"productId": product_id}),
+        )
+        for payload, extra in attempts:
+            try:
+                result = await self._request(
+                    "tuya.m.product.thing.model",
+                    payload,
+                    extra_params=extra,
+                )
+            except XiaohaiError as err:
+                last = str(err)
+                continue
+            parsed = thing_schema(result)
+            if parsed:
+                self._thing_cache[product_id] = parsed
+                self.last_thing_note = ""
+                return parsed
+            last = payload_shape(result)
+        self._thing_cache[product_id] = {}
+        self.last_thing_note = last
+        return {}
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         """Publish datapoints through the Xiaohai cloud."""
