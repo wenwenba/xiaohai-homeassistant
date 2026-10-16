@@ -1,32 +1,74 @@
 """Let the Home app rename and move accessories that this bridge already has.
 
-iOS writes the Configured Name characteristic when a room or name is saved.
-HAP-python advertises Name as read-only and does not add Configured Name, so
-the Home app rejects the save. The same bridge and the same accessory ids are
-kept; nothing new is paired.
+iOS refuses the settings sheet when Name is read-only, and the home hub
+rejects the save when two accessories share a name. Configured Name is added,
+Name is made writable, and a colliding Xiaohai accessory is shown as its
+current area plus its current name. The same bridge and accessory ids stay.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
+from homeassistant.core import HomeAssistant, State
+from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
+from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
 
 _INSTALLED = "xiaohai_homekit_rename"
+_NAMES = "xiaohai_homekit_names"
+_ASSIGNED = "xiaohai_homekit_assigned"
+_CHANGED = "xiaohai_homekit_changed"
+_STORE = "xiaohai_homekit_name_store"
 _SKIP_SERVICES = {"HAPProtocolInformation"}
 _NAME_LIMIT = 64
+_PERMISSIONS = ["pr", "pw", "ev"]
+
+
+def pick_names(
+    rows: list[tuple[str, str, bool, str | None, str | None]],
+) -> tuple[dict[str, str], int]:
+    """Return HomeKit names and how many collisions were split.
+
+    Each row is entity id, preferred name, whether it is Xiaohai, area name,
+    and a name already set on the bridge. A bridge name is left as it is.
+    """
+    chosen = {entity_id: (locked or preferred)[:_NAME_LIMIT] for entity_id, preferred, _xiaohai, _area, locked in rows}
+    original = dict(chosen)
+    counts: dict[str, int] = {}
+    for name in original.values():
+        counts[name] = counts.get(name, 0) + 1
+    changed = 0
+    for entity_id, preferred, is_xiaohai, area, locked in sorted(rows, key=lambda row: row[0]):
+        if locked or not is_xiaohai or counts.get(original[entity_id], 0) < 2:
+            continue
+        candidate = f"{area} {preferred}"[:_NAME_LIMIT] if area else preferred[:_NAME_LIMIT]
+        number = 2
+        while _conflicts(chosen, entity_id, candidate):
+            suffix = f" {number}"
+            stem = f"{area} {preferred}" if area else preferred
+            candidate = f"{stem[: _NAME_LIMIT - len(suffix)]}{suffix}"
+            number += 1
+        if candidate != chosen[entity_id]:
+            chosen[entity_id] = candidate
+            changed += 1
+    return chosen, changed
+
+
+def _conflicts(chosen: dict[str, str], entity_id: str, name: str | None = None) -> bool:
+    current = chosen[entity_id] if name is None else name
+    return any(other != entity_id and value == current for other, value in chosen.items())
 
 
 def _remember_name(accessory: object, value: object) -> None:
-    """Store a Home app rename on the existing entity.
+    """Keep a Home rename without reloading the bridge or renaming the HA device.
 
-    A failure here must not fail the HomeKit write, or the Home app will
-    reject the room change as well.
+    A failure here must not fail the HomeKit write, or the room change fails too.
+    shortcut: names live in .storage, not the HomeKit config entry, so a rename does not reload the bridge.
     """
     try:
         hass = getattr(accessory, "hass", None)
@@ -36,25 +78,49 @@ def _remember_name(accessory: object, value: object) -> None:
         name = value.strip()[:_NAME_LIMIT]
         if not name:
             return
-        state = hass.states.get(entity_id)
-        if state is not None and state.name == name:
-            return
 
         async def _store() -> None:
-            registry = er.async_get(hass)
-            if registry.async_get(entity_id) is None:
+            names = hass.data.setdefault(_NAMES, {})
+            if names.get(entity_id) == name:
                 return
-            registry.async_update_entity(entity_id, name=name)
+            names[entity_id] = name
+            store: Store | None = hass.data.get(_STORE)
+            if store is not None:
+                store.async_delay_save(lambda: {"names": dict(names)}, 1)
 
         hass.add_job(_store)
     except Exception:
         _LOGGER.debug("未能记下家庭 App 里的新名称", exc_info=True)
 
 
-def _attach_configured_name(accessory: object, service: object) -> None:
-    display_name = getattr(service, "display_name", None)
-    if display_name in _SKIP_SERVICES:
+def _make_name_writable(accessory: object, service: object) -> None:
+    try:
+        char = service.get_characteristic("Name")
+    except ValueError:
         return
+    if getattr(char, "_xiaohai_name", False):
+        return
+    char._xiaohai_name = True
+    try:
+        perms = list((getattr(char, "properties", None) or {}).get("Permissions") or [])
+        if "pw" not in perms:
+            char.override_properties({"Permissions": list(_PERMISSIONS)})
+    except Exception:
+        _LOGGER.debug("未能打开名称写入", exc_info=True)
+    previous = char.setter_callback
+
+    def _on_name(value: object, acc: object = accessory, prev=previous) -> None:
+        if prev is not None:
+            prev(value)
+        _remember_name(acc, value)
+
+    char.setter_callback = _on_name
+
+
+def _attach_configured_name(accessory: object, service: object) -> None:
+    if getattr(service, "display_name", None) in _SKIP_SERVICES:
+        return
+    _make_name_writable(accessory, service)
     try:
         service.get_characteristic("ConfiguredName")
         return
@@ -69,10 +135,11 @@ def _attach_configured_name(accessory: object, service: object) -> None:
 
 
 def _install_patch() -> bool:
-    """Add a writable Configured Name before HomeKit assigns characteristic ids."""
+    """Add a writable name before HomeKit assigns characteristic ids."""
     try:
         from pyhap.accessory import Accessory
     except ImportError:
+        _LOGGER.warning("xiaohai: 没有 pyhap，家庭 App 仍不能改名称")
         return False
     if getattr(Accessory.add_service, "_xiaohai_configured_name", False):
         return True
@@ -88,29 +155,112 @@ def _install_patch() -> bool:
     return True
 
 
+def _xiaohai_area(hass: HomeAssistant, entity_id: str) -> tuple[bool, str | None]:
+    entity = er.async_get(hass).async_get(entity_id)
+    if entity is None or entity.platform != "xiaohai":
+        return False, None
+    area_id = entity.area_id
+    if not area_id and entity.device_id:
+        device = dr.async_get(hass).async_get(entity.device_id)
+        area_id = device.area_id if device is not None else None
+    if not area_id:
+        return True, None
+    area = ar.async_get(hass).async_get_area(area_id)
+    return True, area.name if area is not None else None
+
+
+def _assign_names(hass: HomeAssistant, states: list[State], config: dict) -> None:
+    stored = hass.data.get(_NAMES) or {}
+    rows = []
+    for state in states:
+        row = config.get(state.entity_id) if isinstance(config, dict) else None
+        locked = row.get("name") if isinstance(row, dict) else None
+        locked = str(locked) if locked else None
+        preferred = str(stored.get(state.entity_id) or state.name or state.entity_id)
+        is_xiaohai, area = _xiaohai_area(hass, state.entity_id)
+        rows.append((state.entity_id, preferred, is_xiaohai, area, locked))
+    chosen, changed = pick_names(rows)
+    hass.data[_ASSIGNED] = chosen
+    hass.data[_CHANGED] = changed
+
+
+def _install_name_source() -> bool:
+    try:
+        from homeassistant.components import homekit as hk
+    except ImportError:
+        _LOGGER.warning("xiaohai: 没有 HomeKit 组件，无法区分重名")
+        return False
+    if not getattr(hk.HomeKit._async_create_bridge_accessory, "_xiaohai_names", False):
+        original = hk.HomeKit._async_create_bridge_accessory
+
+        async def _async_create_bridge_accessory(self, entity_states):
+            try:
+                _assign_names(self.hass, list(entity_states), self._config)
+            except Exception:
+                _LOGGER.warning("xiaohai: 区分 HomeKit 重名失败", exc_info=True)
+            return await original(self, entity_states)
+
+        _async_create_bridge_accessory._xiaohai_names = True
+        hk.HomeKit._async_create_bridge_accessory = _async_create_bridge_accessory
+
+    if not getattr(hk.get_accessory, "_xiaohai_names", False):
+        original_get = hk.get_accessory
+
+        def get_accessory(hass, driver, state, aid, config):
+            assigned = hass.data.get(_ASSIGNED, {}).get(state.entity_id)
+            if assigned and not config.get("name"):
+                config = dict(config)
+                config["name"] = assigned
+            return original_get(hass, driver, state, aid, config)
+
+        get_accessory._xiaohai_names = True
+        hk.get_accessory = get_accessory
+    return True
+
+
+async def _load_names(hass: HomeAssistant) -> None:
+    store = Store(hass, 1, "xiaohai.homekit_names")
+    hass.data[_STORE] = store
+    data = await store.async_load()
+    names = data.get("names") if isinstance(data, dict) else None
+    hass.data[_NAMES] = dict(names) if isinstance(names, dict) else {}
+
+
 async def _reload_bridges(hass: HomeAssistant) -> None:
-    reloaded = False
-    for entry in hass.config_entries.async_entries("homekit"):
-        if entry.state is not ConfigEntryState.LOADED:
-            continue
+    loaded = []
+    for _ in range(90):
+        entries = hass.config_entries.async_entries("homekit")
+        if not entries:
+            _LOGGER.warning("xiaohai: 没有 HomeKit 桥，名称补丁已安装")
+            return
+        loaded = [entry for entry in entries if entry.state is ConfigEntryState.LOADED]
+        if loaded:
+            break
+        await asyncio.sleep(1)
+    else:
+        _LOGGER.warning("xiaohai: HomeKit 桥未就绪，名称补丁已安装")
+        return
+    for entry in loaded:
         await hass.config_entries.async_reload(entry.entry_id)
-        reloaded = True
-    if reloaded:
-        _LOGGER.warning("HomeKit 桥已按原配件重载，家庭 App 现在可以修改名称和房间")
+    _LOGGER.warning(
+        "xiaohai: HomeKit 桥已按原配件重载，名称可写，%s 个重名已按区域区分",
+        hass.data.get(_CHANGED, 0),
+    )
 
 
 async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
     """Patch the running bridge once, then reload it in place."""
-    if not _install_patch():
-        return
+    await _load_names(hass)
     if hass.data.get(_INSTALLED):
         return
     hass.data[_INSTALLED] = True
+    _install_patch()
+    _install_name_source()
 
-    def _schedule(_event: object = None) -> None:
-        hass.async_create_task(_reload_bridges(hass))
+    async def _apply(_event: object = None) -> None:
+        await _reload_bridges(hass)
 
     if hass.is_running:
-        _schedule()
+        hass.async_create_task(_apply())
         return
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _schedule)
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, lambda _event: hass.async_create_task(_apply()))
