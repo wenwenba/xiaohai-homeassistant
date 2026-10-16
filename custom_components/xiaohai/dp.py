@@ -382,6 +382,33 @@ def panel_speeds(current: Any, values: list[str] | None = None) -> list[str]:
     return ordered
 
 
+def apply_speed_mask(values: list[str], dps: Any) -> list[str]:
+    """Drop fan speeds a per-device bitmask turns off.
+
+    The product range lists every speed. Some units then store a longer digit
+    string whose first characters are 1 or 0 for those speeds, in the same order.
+    A string that is only as long as the list is left alone, so a short reading
+    cannot be mistaken for that mask.
+    """
+    if not values or not isinstance(dps, dict):
+        return values
+    chosen: list[str] | None = None
+    chosen_len = 0
+    for value in dps.values():
+        if not isinstance(value, str) or not value.isdigit() or len(value) <= len(values):
+            continue
+        mask = value[: len(values)]
+        if set(mask) != {"0", "1"}:
+            continue
+        picked = [item for item, bit in zip(values, mask) if bit == "1"]
+        if not picked or len(picked) == len(values):
+            continue
+        if len(value) > chosen_len:
+            chosen = picked
+            chosen_len = len(value)
+    return values if chosen is None else chosen
+
+
 def speed_choices(current: Any, values: list[str] | None = None) -> list[str] | None:
     """Fan speeds from the cloud enum. The current value is kept visible."""
     text = "" if current is None else str(current)
@@ -837,6 +864,22 @@ def _self_check() -> None:
     apply_panel_schema(five, product_schema)
     assert json.loads(five["@range:fan_speed_enum"])[-1] == "level_5"
     assert profile({"_schema": five})["fan_values"][-1] == "level_5"
+    speeds = ["level_1", "level_2", "level_3", "level_4", "level_5", "auto"]
+    three_mask = "10101001111110000000000000000000010201"
+    five_mask = "11111001111110000000000000000000010201"
+    assert apply_speed_mask(speeds, {"107": three_mask, "108": "000000000000"}) == [
+        "level_1",
+        "level_3",
+        "level_5",
+    ]
+    assert apply_speed_mask(speeds, {"5": "level_1", "107": five_mask}) == [
+        "level_1",
+        "level_2",
+        "level_3",
+        "level_4",
+        "level_5",
+    ]
+    assert apply_speed_mask(["level1", "level2"], {"101": "01"}) == ["level1", "level2"]
     three = {
         "mode": "4",
         "@range:mode": "[\"auto\",\"cold\",\"hot\",\"wet\",\"wind\"]",
