@@ -530,10 +530,10 @@ def _schema_beans(payload: Any) -> list[dict]:
 
 
 def expand_speed_range(schema: dict[str, str], payload: Any) -> list[str] | None:
-    """Replace a short standard speed list with the longer device enum, when one exists.
+    """Replace the standard speed list with the panel enum for this product version.
 
-    The panel reads SchemaBean.property.range. The standard config often keeps
-    only low, middle and high.
+    The panel reads SchemaBean.property.range. A three-gear panel list replaces
+    a longer standard list, and a five-gear list replaces a shorter one.
     """
     expanded: list[str] | None = None
     for item in _schema_beans(payload):
@@ -549,9 +549,6 @@ def expand_speed_range(schema: dict[str, str], payload: Any) -> list[str] | None
                 continue
             label = f"{key} {code}"
             if not any(hint in label for hint in ("speed", "fan", "wind", "volume", "level")):
-                continue
-            current = _enum_range({"valueRange": schema.get(f"@range:{key}")}) or []
-            if len(enum_range) <= len(current):
                 continue
             schema[f"@range:{key}"] = json.dumps(enum_range, ensure_ascii=False)
             expanded = enum_range
@@ -846,6 +843,24 @@ def _self_check() -> None:
         "level_5",
     ]
     assert profile({"_schema": five})["fan_values"][-1] == "level_5"
+    three = {
+        "fan_speed_enum": "5",
+        "@range:fan_speed_enum": "[\"auto\",\"level_1\",\"level_2\",\"level_3\"]",
+    }
+    short_schema = {
+        "schemaInfo": {
+            "schema": json.dumps(
+                [
+                    {
+                        "id": "5",
+                        "code": "fan_speed_enum",
+                        "property": {"type": "enum", "range": ["level_1", "level_2", "level_3"]},
+                    }
+                ]
+            )
+        }
+    }
+    assert expand_speed_range(three, short_schema) == ["level_1", "level_2", "level_3"]
     assert panel_speeds("level1", ["level1", "level2", "level3"]) == ["level1", "level2"]
     assert panel_speeds("level_1", ["level_1", "level_2", "level_3"]) == ["level_1", "level_2", "level_3"]
 

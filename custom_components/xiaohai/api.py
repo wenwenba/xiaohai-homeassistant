@@ -28,6 +28,25 @@ def _mobile_hash(data: str) -> str:
     return digest[8:16] + digest[0:8] + digest[24:32] + digest[16:24]
 
 
+def _version_map(payload: Any) -> dict[str, str]:
+    found: dict[str, str] = {}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            dev_id = node.get("devId")
+            version = node.get("productVer") or node.get("productVersion")
+            if dev_id and version:
+                found[str(dev_id)] = str(version)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(payload)
+    return found
+
+
 def password_digest(password: str) -> str:
     """MD5 of the password, which is what the cloud compares at login."""
     return hashlib.md5(password.encode("utf-8")).hexdigest()
@@ -68,6 +87,9 @@ class XiaohaiClient:
         self.last_room_note = ""
         self.last_schema_note = ""
         self._product_info: dict[str, Any] = {}
+        self._versions: dict[str, str] = {}
+        self._version_sources: tuple[str, ...] | None = None
+        self.last_version_note = ""
         self.devices: dict[str, dict[str, Any]] = {}
 
     @property
@@ -186,54 +208,118 @@ class XiaohaiClient:
             return {}
         return schema_from_payload(result)
 
-    async def async_product_beans(
-        self,
-        product_ids: list[str],
-        versions: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        """Product beans whose schema string holds each datapoint range.
+    async def async_attach_product_versions(self, devices: list[dict[str, Any]]) -> None:
+        """Copy each device's productVer from the list the app uses.
+
+        The home list calls tuya.m.device.biz.prop.list, then the device bean
+        list tuya.m.device.ext.prop.list. The plain device list often omits
+        the version, which is what selects the datapoint range.
+        """
+        gids = []
+        for device in devices:
+            gid = device.get("_group_id")
+            if gid is not None and gid not in gids:
+                gids.append(gid)
+        if not gids or self._version_sources == ("none",):
+            self._apply_versions(devices)
+            return
+        sources = ("list21", "biz", "ext") if self._version_sources is None else self._version_sources
+        per_source: dict[str, dict[str, str]] = {}
+        errors: list[str] = []
+        for source in sources:
+            source_found: dict[str, str] = {}
+            for gid in gids:
+                try:
+                    payload = await self._version_payload(source, gid)
+                except XiaohaiError as err:
+                    errors.append(f"{source} {err}")
+                    continue
+                source_found.update(_version_map(payload))
+            if source_found:
+                per_source[source] = source_found
+        if self._version_sources is None:
+            varied = [name for name, mapping in per_source.items() if len(set(mapping.values())) > 1]
+            chosen = varied or list(per_source)
+            self._version_sources = tuple(chosen) if chosen else ("none",)
+            self.last_version_note = "" if chosen else " ".join(errors)[:300]
+        found: dict[str, str] = {}
+        for source in self._version_sources:
+            found.update(per_source.get(source, {}))
+        if found:
+            self._versions.update(found)
+        self._apply_versions(devices)
+
+    def _apply_versions(self, devices: list[dict[str, Any]]) -> None:
+        for device in devices:
+            version = self._versions.get(str(device.get("devId") or ""))
+            if version:
+                device["productVer"] = version
+
+    async def _version_payload(self, source: str, gid: Any) -> Any:
+        gid_s = str(gid)
+        if source == "biz":
+            return await self._request(
+                "tuya.m.device.biz.prop.list",
+                {"gid": gid_s},
+                version="1.0",
+            )
+        if source == "ext":
+            return await self._request(
+                "tuya.m.device.ext.prop.list",
+                None,
+                extra_params={"gid": gid_s},
+                version="1.0",
+            )
+        return await self._request(
+            "tuya.m.my.group.device.list",
+            None,
+            extra_params={"gid": gid_s},
+            version="2.1",
+        )
+
+    async def async_product_beans(self, pairs: list[tuple[str, str]]) -> dict[str, Any]:
+        """Product beans for each product id and version.
 
         The panel calls tuya.m.device.ref.info.list 6.1. productIds is a JSON
-        string of product id plus version, not a raw list.
+        string of {pid, ver}, and the schema for that pair holds the datapoint
+        range. Refetched on each poll so a panel gear change shows up.
         """
-        missing = [product_id for product_id in product_ids if product_id not in self._product_info]
-        if missing:
-            known = versions or {}
-            payload = {
-                "productIds": json.dumps(
-                    [
-                        {"pid": product_id, "ver": known.get(product_id) or "1.0.0"}
-                        for product_id in missing
-                    ],
-                    separators=(",", ":"),
-                ),
-                "zigbeeGroup": True,
-            }
-            try:
-                result = await self._request(
-                    "tuya.m.device.ref.info.list",
-                    payload,
-                    version="6.1",
-                )
-            except XiaohaiError as err:
-                for product_id in missing:
-                    self._product_info[product_id] = None
-                self.last_schema_note = str(err)
-                result = None
-            else:
-                self.last_schema_note = ""
-            rows = result if isinstance(result, list) else []
-            by_id: dict[str, Any] = {}
-            for item in rows:
+        if not pairs:
+            return {}
+        payload = {
+            "productIds": json.dumps(
+                [{"pid": product_id, "ver": version} for product_id, version in pairs],
+                separators=(",", ":"),
+            ),
+            "zigbeeGroup": True,
+        }
+        try:
+            result = await self._request(
+                "tuya.m.device.ref.info.list",
+                payload,
+                version="6.1",
+            )
+        except XiaohaiError as err:
+            self.last_schema_note = str(err)
+        else:
+            self.last_schema_note = ""
+            found: dict[str, Any] = {}
+            for item in result if isinstance(result, list) else []:
                 if not isinstance(item, dict):
                     continue
                 product_id = str(item.get("id") or item.get("productId") or "")
+                version = str(item.get("productVer") or "")
                 if product_id:
-                    by_id[product_id] = item
-            if result is not None:
-                for product_id in missing:
-                    self._product_info[product_id] = by_id.get(product_id)
-        return {product_id: self._product_info.get(product_id) for product_id in product_ids}
+                    found[f"{product_id}|{version}"] = item
+            for product_id, version in pairs:
+                key = f"{product_id}|{version}"
+                bean = found.get(key)
+                if bean is None:
+                    same = [item for name, item in found.items() if name.startswith(f"{product_id}|")]
+                    bean = same[0] if len(same) == 1 else None
+                if bean is not None:
+                    self._product_info[key] = bean
+        return {f"{product_id}|{version}": self._product_info.get(f"{product_id}|{version}") for product_id, version in pairs}
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         """Publish datapoints through the Xiaohai cloud."""
