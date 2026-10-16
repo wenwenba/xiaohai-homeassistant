@@ -30,6 +30,9 @@ _SPEED_ENTITY_IDS = (
     "fan.wen_wen_kong_diao_kong_diao_1_feng_su",
     "fan.wen_wen_kong_diao_feng_su",
 )
+# Aid storage is keyed by unique id, not by the entity id shown in Home Assistant.
+_SPEED_KEY_MARKS = ("06zyzx_fan", "73cn5c_fan", *_SPEED_ENTITY_IDS)
+_SPEED_RELOAD = "xiaohai_homekit_speed_reload_attempted"
 _LOCKED_SPEED_NAME = "空调风速"
 _SKIP_SERVICES = {"HAPProtocolInformation"}
 _NAME_LIMIT = 64
@@ -256,6 +259,17 @@ def _drop_locked_speed_names(hass: HomeAssistant) -> None:
             names.pop(entity_id, None)
 
 
+def _locked_speed_keys(storage: object) -> list[str]:
+    found: list[str] = []
+    for key in storage.allocations:
+        text = str(key)
+        if text.startswith("xiaohai.retired."):
+            continue
+        if any(mark in text for mark in _SPEED_KEY_MARKS):
+            found.append(text)
+    return found
+
+
 async def _rotate_speed_aids(homekit: object) -> dict[str, int]:
     """Give the locked speed fans a new aid, once.
 
@@ -268,20 +282,21 @@ async def _rotate_speed_aids(homekit: object) -> dict[str, int]:
     if storage is None:
         return {}
     retired: dict[str, int] = {}
-    for entity_id in _SPEED_ENTITY_IDS:
-        old = storage.get_allocated_aid_for_entity_id(entity_id)
+    for key in _locked_speed_keys(storage):
+        old = storage.allocations.get(key)
         if old is None:
             continue
-        storage.async_delete_aid_for_entity_id(entity_id)
+        storage.delete_aid(key)
         storage.allocations[f"xiaohai.retired.{old}"] = old
         storage.allocated_aids.add(old)
-        retired[entity_id] = old
+        retired[key] = old
+    if not retired:
+        return {}
     hass.data[_SPEED_ROTATED] = True
     store: Store | None = hass.data.get(_STORE)
     if store is not None:
         await store.async_save(_stored(hass))
-    if retired:
-        await storage.async_save()
+    await storage.async_save()
     return retired
 
 
@@ -367,8 +382,32 @@ async def _load_names(hass: HomeAssistant) -> None:
     hass.data[_SPEED_ROTATED] = bool(data.get("speed_aids_rotated")) if isinstance(data, dict) else False
 
 
+async def _reload_bridge_for_speed_ids(hass: HomeAssistant) -> None:
+    """Rebuild the bridge once so the locked fans are created again.
+
+    The bridge is often built before this integration is set up, so the
+    one-time rotation inside accessory creation never sees those fans.
+    """
+    if hass.data.get(_SPEED_ROTATED) or hass.data.get(_SPEED_RELOAD):
+        return
+    hass.data[_SPEED_RELOAD] = True
+    from homeassistant.config_entries import ConfigEntryState
+
+    entries = [
+        entry
+        for entry in hass.config_entries.async_entries("homekit")
+        if entry.state is ConfigEntryState.LOADED
+    ]
+    if not entries:
+        hass.data[_SPEED_RELOAD] = False
+        return
+    _LOGGER.warning("xiaohai: 重新加载家庭桥以更换风速配件编号")
+    for entry in entries:
+        await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
-    """Patch the bridge before it builds accessories. Do not reload it."""
+    """Patch the bridge before it builds accessories."""
     await _load_names(hass)
     if hass.data.get(_INSTALLED):
         return
@@ -376,3 +415,14 @@ async def async_enable_homekit_rename(hass: HomeAssistant) -> None:
     _install_patch()
     _install_name_source()
     _LOGGER.warning("xiaohai: 名称补丁已安装")
+    if hass.data.get(_SPEED_ROTATED):
+        return
+    if hass.is_running:
+        hass.async_create_task(_reload_bridge_for_speed_ids(hass))
+        return
+    from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+
+    async def _after_start(_event: object) -> None:
+        await _reload_bridge_for_speed_ids(hass)
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _after_start)
