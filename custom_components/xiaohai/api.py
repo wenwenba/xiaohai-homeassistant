@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 
 from .const import API_URL, API_VERSION, CLIENT_ID, ET_VERSION, SIGN_KEY, USER_AGENT
-from .dp import payload_shape, rooms_from_payload, schema_from_payload, thing_schema
+from .dp import payload_shape, rooms_from_payload, schema_from_payload
 
 
 class XiaohaiError(Exception):
@@ -66,8 +66,6 @@ class XiaohaiClient:
         self._country_code = country_code.strip() or "86"
         self._sid: str | None = None
         self.last_room_note = ""
-        self.last_thing_note = ""
-        self._thing_cache: dict[str, dict[str, str]] = {}
         self.devices: dict[str, dict[str, Any]] = {}
 
     @property
@@ -185,31 +183,6 @@ class XiaohaiClient:
         except XiaohaiError:
             return {}
         return schema_from_payload(result)
-
-    async def async_ref_specs(self, gid: Any) -> dict[str, dict[str, str]]:
-        """Per-product datapoints from the device reference list."""
-        key = str(gid)
-        if key in self._thing_cache:
-            return self._thing_cache[key]
-        try:
-            result = await self._request(
-                "tuya.m.device.ref.info.my.list",
-                None,
-                extra_params={"gid": key},
-            )
-        except XiaohaiError as err:
-            self.last_thing_note = str(err)
-            self._thing_cache[key] = {}
-            return {}
-        parsed = schema_from_payload(result)
-        loose = thing_schema(result)
-        if not parsed and loose:
-            self.last_thing_note = ",".join(sorted(key for key in loose if not key.startswith("@"))[:20])
-            self._thing_cache[key] = {}
-            return {}
-        self.last_thing_note = "" if parsed else payload_shape(result)
-        self._thing_cache[key] = parsed
-        return parsed
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         """Publish datapoints through the Xiaohai cloud."""

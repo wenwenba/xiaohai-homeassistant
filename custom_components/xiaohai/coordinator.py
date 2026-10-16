@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import _speed_code, device_id_from_unique_id, profile
+from .dp import device_id_from_unique_id, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,26 +59,6 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 _LOGGER.warning("房间关系没有解析出来：%s", self.client.last_room_note)
                 self._room_warned = True
             schemas.update(await self.client.async_product_schema(gid))
-        needs_speed = False
-        for device in devices:
-            product_id = str(device.get("productId") or "")
-            schema = schemas.get(product_id) or {}
-            if (
-                (schema.get("switch") or schema.get("switch_led"))
-                and not schema.get("temp_set")
-                and not schema.get("temp_current")
-                and _speed_code(schema) is None
-            ):
-                needs_speed = True
-                break
-        if needs_speed:
-            for gid in gids:
-                for product_id, extra in (await self.client.async_ref_specs(gid)).items():
-                    if product_id == "_" or not extra:
-                        continue
-                    merged = dict(schemas.get(product_id) or {})
-                    merged.update(extra)
-                    schemas[product_id] = merged
 
         indexed = {}
         for device in devices:
@@ -118,10 +98,9 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                     if len(samples) >= 2:
                         break
                 _LOGGER.warning(
-                    "云端有功能码但没有风速：%s %s %s",
+                    "云端有功能码但没有风速：%s %s",
                     " | ".join(missing[:6]),
                     " ".join(samples),
-                    self.client.last_thing_note,
                 )
             self._speed_noted = True
         ids = tuple(sorted(indexed))
