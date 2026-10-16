@@ -66,6 +66,8 @@ class XiaohaiClient:
         self._country_code = country_code.strip() or "86"
         self._sid: str | None = None
         self.last_room_note = ""
+        self.last_schema_note = ""
+        self._product_info: dict[str, Any] = {}
         self.devices: dict[str, dict[str, Any]] = {}
 
     @property
@@ -183,6 +185,20 @@ class XiaohaiClient:
         except XiaohaiError:
             return {}
         return schema_from_payload(result)
+
+    async def async_product_info(self, product_id: str) -> Any:
+        """Product definition, including the schema string the panel uses for enums."""
+        if product_id in self._product_info:
+            return self._product_info[product_id]
+        try:
+            result = await self._request("tuya.m.product.info.get", {"productId": product_id})
+        except XiaohaiError as err:
+            self._product_info[product_id] = None
+            self.last_schema_note = str(err)
+            return None
+        self._product_info[product_id] = result
+        self.last_schema_note = ""
+        return result
 
     async def async_publish(self, device: dict[str, Any], dps: dict[str, Any]) -> Any:
         """Publish datapoints through the Xiaohai cloud."""

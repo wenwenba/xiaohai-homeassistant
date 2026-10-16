@@ -489,6 +489,72 @@ def payload_shape(payload: Any) -> str:
     return repr(payload)[:40]
 
 
+def _schema_beans(payload: Any) -> list[dict]:
+    """SchemaBean rows from a product schema string or a product-info response."""
+    found: list[dict] = []
+
+    def take(raw: Any) -> None:
+        parsed = raw
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text or text[:1] != "[":
+                return
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return
+        if not isinstance(parsed, list):
+            return
+        for item in parsed:
+            if isinstance(item, dict) and (item.get("id") is not None or item.get("code")) and "property" in item:
+                found.append(item)
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in ("schema", "schemaInfo"):
+                if key in node:
+                    value = node[key]
+                    take(value.get("schema") if isinstance(value, dict) else value)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            take(node)
+            for value in node:
+                visit(value)
+
+    visit(payload)
+    return found
+
+
+def expand_speed_range(schema: dict[str, str], payload: Any) -> list[str] | None:
+    """Replace a short standard speed list with the longer device enum, when one exists.
+
+    The panel reads SchemaBean.property.range. The standard config often keeps
+    only low, middle and high.
+    """
+    expanded: list[str] | None = None
+    for item in _schema_beans(payload):
+        enum_range = _enum_range(item)
+        if not enum_range:
+            continue
+        code = str(item.get("code") or "")
+        dp = str(item.get("id")) if item.get("id") is not None else ""
+        for key, value in list(schema.items()):
+            if not isinstance(key, str) or key.startswith("@"):
+                continue
+            if value != dp and key != code:
+                continue
+            label = f"{key} {code}"
+            if not any(hint in label for hint in ("speed", "fan", "wind", "volume", "level")):
+                continue
+            current = _enum_range({"valueRange": schema.get(f"@range:{key}")}) or []
+            if len(enum_range) <= len(current):
+                continue
+            schema[f"@range:{key}"] = json.dumps(enum_range, ensure_ascii=False)
+            expanded = enum_range
+    return expanded
+
+
 def schema_from_payload(payload: Any) -> dict[str, dict[str, str]]:
     """productId -> {datapoint code: dp id}."""
     found: dict[str, dict[str, str]] = {}
@@ -748,6 +814,35 @@ def _self_check() -> None:
     reported = profile({"_schema": {"switch": "1"}, "dps": {"1": False, "12": "level1", "9": 22}})
     assert reported["kind"] == "fan" and reported["power"] == "1" and reported["fan"] == "12"
     assert reported["fan_values"] == ["level1", "level2"]
+    five = {
+        "fan_speed_enum": "5",
+        "@range:fan_speed_enum": "[\"auto\",\"level_1\",\"level_2\",\"level_3\"]",
+    }
+    product_schema = {
+        "schemaInfo": {
+            "schema": json.dumps(
+                [
+                    {
+                        "id": "5",
+                        "code": "fan_speed_enum",
+                        "property": {
+                            "type": "enum",
+                            "range": ["auto", "level_1", "level_2", "level_3", "level_4", "level_5"],
+                        },
+                    }
+                ]
+            )
+        }
+    }
+    assert expand_speed_range(five, product_schema) == [
+        "auto",
+        "level_1",
+        "level_2",
+        "level_3",
+        "level_4",
+        "level_5",
+    ]
+    assert profile({"_schema": five})["fan_values"][-1] == "level_5"
     assert panel_speeds("level1", ["level1", "level2", "level3"]) == ["level1", "level2"]
     assert panel_speeds("level_1", ["level_1", "level_2", "level_3"]) == ["level_1", "level_2", "level_3"]
 

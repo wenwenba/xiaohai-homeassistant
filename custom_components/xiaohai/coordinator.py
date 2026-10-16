@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .api import XiaohaiAuthError, XiaohaiClient, XiaohaiError
 from .const import DOMAIN, SCAN_INTERVAL_SECONDS
-from .dp import device_id_from_unique_id, profile
+from .dp import device_id_from_unique_id, expand_speed_range, profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self.client = client
         self._room_warned = False
         self._speed_noted = False
+        self._fan_noted = False
         self._device_ids: tuple[str, ...] = ()
 
     async def _async_update_data(self) -> dict[str, dict]:
@@ -59,6 +60,36 @@ class XiaohaiCoordinator(DataUpdateCoordinator[dict[str, dict]]):
                 _LOGGER.warning("房间关系没有解析出来：%s", self.client.last_room_note)
                 self._room_warned = True
             schemas.update(await self.client.async_product_schema(gid))
+
+        speed_notes: list[str] = []
+        for product_id, schema in schemas.items():
+            if not any(
+                isinstance(key, str)
+                and not key.startswith("@")
+                and any(hint in key for hint in ("speed", "fan", "wind", "volume", "level"))
+                for key in schema
+            ):
+                continue
+            detail = await self.client.async_product_info(product_id)
+            expanded = expand_speed_range(schema, detail)
+            if not expanded:
+                own = next(
+                    (
+                        device.get("schema")
+                        for device in devices
+                        if str(device.get("productId") or "") == product_id and device.get("schema")
+                    ),
+                    None,
+                )
+                expanded = expand_speed_range(schema, own)
+            if expanded:
+                speed_notes.append(f"{product_id}:{','.join(expanded)}")
+        if not self._fan_noted:
+            if speed_notes:
+                _LOGGER.warning("风速改用产品定义里的枚举：%s", " | ".join(speed_notes[:4]))
+            elif self.client.last_schema_note:
+                _LOGGER.warning("产品定义没有取到：%s", self.client.last_schema_note)
+            self._fan_noted = True
 
         indexed = {}
         for device in devices:
